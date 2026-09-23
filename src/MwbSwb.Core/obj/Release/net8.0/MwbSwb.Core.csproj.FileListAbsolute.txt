@@ -1,0 +1,11 @@
+H:\mwb+swb\src\MwbSwb.Core\obj\Release\net8.0\MwbSwb.Core.GeneratedMSBuildEditorConfig.editorconfig
+H:\mwb+swb\src\MwbSwb.Core\obj\Release\net8.0\MwbSwb.Core.AssemblyInfoInputs.cache
+H:\mwb+swb\src\MwbSwb.Core\obj\Release\net8.0\MwbSwb.Core.AssemblyInfo.cs
+H:\mwb+swb\src\MwbSwb.Core\obj\Release\net8.0\MwbSwb.Core.csproj.CoreCompileInputs.cache
+H:\mwb+swb\src\MwbSwb.Core\bin\Release\net8.0\MwbSwb.Core.deps.json
+H:\mwb+swb\src\MwbSwb.Core\bin\Release\net8.0\MwbSwb.Core.dll
+H:\mwb+swb\src\MwbSwb.Core\bin\Release\net8.0\MwbSwb.Core.pdb
+H:\mwb+swb\src\MwbSwb.Core\obj\Release\net8.0\MwbSwb.Core.dll
+H:\mwb+swb\src\MwbSwb.Core\obj\Release\net8.0\refint\MwbSwb.Core.dll
+H:\mwb+swb\src\MwbSwb.Core\obj\Release\net8.0\MwbSwb.Core.pdb
+H:\mwb+swb\src\MwbSwb.Core\obj\Release\net8.0\ref\MwbSwb.Core.dll
