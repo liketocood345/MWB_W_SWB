@@ -20,7 +20,7 @@ public partial class MainForm : Form
 
     public MainForm()
     {
-        Text = "MWB + SWB — Sound Synchro";
+        Text = "MWB+SWB Sound Synchro (prototype App; prefer MwbSwb.Host)";
         Width = 780;
         Height = 560;
         MinimumSize = new Size(640, 480);
@@ -44,27 +44,27 @@ public partial class MainForm : Form
             Padding = new Padding(12),
         };
 
-        _chkSoundSynchro.Text = "Sound Synchro（勾选后：用 MWB 机器表握手，再经局域网纳入发声矩阵）";
+        _chkSoundSynchro.Text = "Sound Synchro (optional SWB; MWB-only if peers lack SWB)";
         _chkSoundSynchro.AutoSize = true;
         _chkSoundSynchro.Location = new Point(12, 12);
         _chkSoundSynchro.CheckedChanged += async (_, _) => await OnSoundSynchroChangedAsync();
 
-        _chkSend.Text = "本机环回 → 矩阵对端";
+        _chkSend.Text = "Send local loopback -> peers";
         _chkSend.AutoSize = true;
         _chkSend.Checked = true;
         _chkSend.Location = new Point(12, 42);
 
-        _chkRecv.Text = "接收对端 → 本机立体声播放";
+        _chkRecv.Text = "Receive peers -> local mix";
         _chkRecv.AutoSize = true;
         _chkRecv.Checked = true;
         _chkRecv.Location = new Point(220, 42);
 
-        _btnRefreshMwb.Text = "刷新 MWB 配置";
+        _btnRefreshMwb.Text = "Refresh MWB settings";
         _btnRefreshMwb.Location = new Point(12, 70);
         _btnRefreshMwb.Width = 120;
         _btnRefreshMwb.Click += (_, _) => RefreshMwbStatus();
 
-        _btnHandshake.Text = "立即握手";
+        _btnHandshake.Text = "Probe peers";
         _btnHandshake.Location = new Point(140, 70);
         _btnHandshake.Width = 100;
         _btnHandshake.Enabled = false;
@@ -90,12 +90,12 @@ public partial class MainForm : Form
         _matrix.View = View.Details;
         _matrix.FullRowSelect = true;
         _matrix.CheckBoxes = true;
-        _matrix.Columns.Add("纳入矩阵", 80);
-        _matrix.Columns.Add("主机", 140);
-        _matrix.Columns.Add("地址", 140);
-        _matrix.Columns.Add("音频端口", 80);
-        _matrix.Columns.Add("立体声", 70);
-        _matrix.Columns.Add("状态", 120);
+        _matrix.Columns.Add("Host", 80);
+        _matrix.Columns.Add("Host", 140);
+        _matrix.Columns.Add("IP", 140);
+        _matrix.Columns.Add("Audio port", 80);
+        _matrix.Columns.Add("Stereo", 70);
+        _matrix.Columns.Add("Status", 120);
         _matrix.ItemChecked += (_, e) =>
         {
             if (_audio == null || e.Item == null) return;
@@ -105,7 +105,7 @@ public partial class MainForm : Form
 
         var matrixLabel = new Label
         {
-            Text = "发声设备矩阵（对端 PC）",
+            Text = "Sounding-device matrix (remote PCs)",
             Dock = DockStyle.Top,
             Height = 24,
             Padding = new Padding(12, 6, 0, 0),
@@ -121,7 +121,7 @@ public partial class MainForm : Form
 
         var logLabel = new Label
         {
-            Text = "日志",
+            Text = "Log",
             Dock = DockStyle.Top,
             Height = 24,
             Padding = new Padding(12, 6, 0, 0),
@@ -138,9 +138,9 @@ public partial class MainForm : Form
     {
         _mwb = MwbSettings.LoadOrEmpty();
         var peers = string.Join(", ", _mwb.MachineMatrix);
-        if (string.IsNullOrEmpty(peers)) peers = "(无)";
-        var keyOk = string.IsNullOrWhiteSpace(_mwb.SecurityKey) ? "无 SecurityKey" : "SecurityKey 已读";
-        _mwbStatus.Text = $"本机={_mwb.LocalHostName} | {keyOk} | 矩阵=[{peers}]";
+        if (string.IsNullOrEmpty(peers)) peers = "(none)";
+        var keyOk = string.IsNullOrWhiteSpace(_mwb.SecurityKey) ? "no SecurityKey" : "SecurityKey present";
+        _mwbStatus.Text = $"host={_mwb.LocalHostName} | {keyOk} | peers=[{peers}]";
         AppendLog($"MWB settings: {_mwb.SettingsPath}");
         AppendLog(_mwbStatus.Text);
     }
@@ -156,11 +156,11 @@ public partial class MainForm : Form
     private async Task EnableSoundSynchroAsync()
     {
         RefreshMwbStatus();
-        if (!_mwb.IsReadyForHandshake)
+        if (!_mwb.IsReadyForSwb)
         {
             _chkSoundSynchro.Checked = false;
             MessageBox.Show(
-                "未读到可用的 Mouse Without Borders 配置。\n请先在 PowerToys 中配对双机/多机，并确认 settings.json 含 SecurityKey 与 MachineMatrixString。",
+                "MWB SecurityKey missing. SWB only needs the shared SecurityKey (machine list optional).",
                 Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
@@ -216,7 +216,7 @@ public partial class MainForm : Form
                 existing.SubItems[2].Text = peer.IpAddress;
                 existing.SubItems[3].Text = peer.AudioPort.ToString();
                 existing.SubItems[4].Text = peer.StereoOk ? "OK" : "NO";
-                existing.SubItems[5].Text = "已握手";
+                existing.SubItems[5].Text = "updated";
                 return;
             }
         }
@@ -227,7 +227,7 @@ public partial class MainForm : Form
         item.SubItems.Add(peer.IpAddress);
         item.SubItems.Add(peer.AudioPort.ToString());
         item.SubItems.Add(peer.StereoOk ? "OK" : "NO");
-        item.SubItems.Add("已握手");
+        item.SubItems.Add("ready");
         _matrix.Items.Add(item);
     }
 

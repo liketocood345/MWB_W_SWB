@@ -27,74 +27,99 @@ public sealed class MwbSettings
     {
         path ??= DefaultSettingsPath;
         if (!File.Exists(path))
+            return new MwbSettings { SettingsPath = path, LocalHostName = Environment.MachineName };
+
+        try
         {
+            using var doc = JsonDocument.Parse(File.ReadAllText(path));
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("properties", out var props))
+                return new MwbSettings { SettingsPath = path, LocalHostName = Environment.MachineName };
+
+            var key = ReadStringValue(props, "SecurityKey") ?? "";
+            var matrix = ReadStringList(props, "MachineMatrixString");
+
+            if (matrix.Count == 0)
+            {
+                var pool = ReadStringValue(props, "MachinePool");
+                if (!string.IsNullOrWhiteSpace(pool))
+                {
+                    matrix = pool
+                        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                        .Select(part => part.Split(':', 2)[0].Trim())
+                        .Where(n => !string.IsNullOrWhiteSpace(n)
+                                    && !n.Equals("NONE", StringComparison.OrdinalIgnoreCase)
+                                    && n != "")
+                        .ToList();
+                }
+            }
+
+            return new MwbSettings
+            {
+                SettingsPath = path,
+                SecurityKey = key,
+                LocalHostName = Environment.MachineName,
+                MachineMatrix = matrix,
+            };
+        }
+        catch (JsonException)
+        {
+            // Corrupt / unexpected schema must not crash Host — treat as empty.
             return new MwbSettings { SettingsPath = path, LocalHostName = Environment.MachineName };
         }
-
-        using var stream = File.OpenRead(path);
-        var doc = JsonSerializer.Deserialize<MwbSettingsDto>(stream, JsonOptions) ?? new MwbSettingsDto();
-        var props = doc.Properties ?? new MwbPropertiesDto();
-        var key = props.SecurityKey?.Value?.Trim() ?? "";
-        var matrix = props.MachineMatrixString?.Value?
-            .Where(s => !string.IsNullOrWhiteSpace(s))
-            .Select(s => s!.Trim())
-            .ToList() ?? new List<string>();
-
-        if (matrix.Count == 0 && !string.IsNullOrWhiteSpace(props.MachinePool?.Value))
-        {
-            matrix = props.MachinePool.Value
-                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .Select(part => part.Split(':', 2)[0].Trim())
-                .Where(n => !string.IsNullOrWhiteSpace(n) && !n.Equals("NONE", StringComparison.OrdinalIgnoreCase))
-                .ToList();
-        }
-
-        return new MwbSettings
-        {
-            SettingsPath = path,
-            SecurityKey = key,
-            LocalHostName = Environment.MachineName,
-            MachineMatrix = matrix,
-        };
     }
 
     public bool IsReadyForHandshake =>
         !string.IsNullOrWhiteSpace(SecurityKey) && MachineMatrix.Count > 0;
 
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        PropertyNameCaseInsensitive = true,
-        ReadCommentHandling = JsonCommentHandling.Skip,
-        AllowTrailingCommas = true,
-    };
+    /// <summary>SWB only needs the shared SecurityKey; MWB matrix is optional discovery hint.</summary>
+    public bool IsReadyForSwb =>
+        !string.IsNullOrWhiteSpace(SecurityKey);
 
-    private sealed class MwbSettingsDto
+    /// <summary>Accepts {"value":"..."} or bare string.</summary>
+    private static string? ReadStringValue(JsonElement props, string name)
     {
-        [JsonPropertyName("properties")]
-        public MwbPropertiesDto? Properties { get; set; }
+        if (!props.TryGetProperty(name, out var el)) return null;
+        if (el.ValueKind == JsonValueKind.String) return el.GetString();
+        if (el.ValueKind == JsonValueKind.Object && el.TryGetProperty("value", out var v))
+        {
+            if (v.ValueKind == JsonValueKind.String) return v.GetString();
+            if (v.ValueKind == JsonValueKind.Number) return v.ToString();
+        }
+        return null;
     }
 
-    private sealed class MwbPropertiesDto
+    /// <summary>
+    /// Accepts {"value":["a","b"]}, bare ["a","b"], or {"value":"a,b"}.
+    /// </summary>
+    private static List<string> ReadStringList(JsonElement props, string name)
     {
-        [JsonPropertyName("SecurityKey")]
-        public StringProp? SecurityKey { get; set; }
+        var list = new List<string>();
+        if (!props.TryGetProperty(name, out var el)) return list;
 
-        [JsonPropertyName("MachineMatrixString")]
-        public StringListProp? MachineMatrixString { get; set; }
+        JsonElement arrOrVal = el;
+        if (el.ValueKind == JsonValueKind.Object && el.TryGetProperty("value", out var inner))
+            arrOrVal = inner;
 
-        [JsonPropertyName("MachinePool")]
-        public StringProp? MachinePool { get; set; }
-    }
+        if (arrOrVal.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in arrOrVal.EnumerateArray())
+            {
+                if (item.ValueKind == JsonValueKind.String)
+                {
+                    var s = item.GetString();
+                    if (!string.IsNullOrWhiteSpace(s)) list.Add(s.Trim());
+                }
+            }
+            return list;
+        }
 
-    private sealed class StringProp
-    {
-        [JsonPropertyName("value")]
-        public string? Value { get; set; }
-    }
+        if (arrOrVal.ValueKind == JsonValueKind.String)
+        {
+            var s = arrOrVal.GetString() ?? "";
+            list.AddRange(s.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        }
 
-    private sealed class StringListProp
-    {
-        [JsonPropertyName("value")]
-        public List<string?>? Value { get; set; }
+        return list;
     }
 }

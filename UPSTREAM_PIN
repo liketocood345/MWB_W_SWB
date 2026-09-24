@@ -1,0 +1,9 @@
+# MWB+SWB unique upstream pin — do not float with PowerToys releases
+UPSTREAM_REPO=https://github.com/microsoft/PowerToys
+UPSTREAM_MODULE=src/modules/MouseWithoutBorders
+UPSTREAM_TAG=v0.99.1
+UPSTREAM_COMMIT=184ccb75ec85cc799d04555f34ffae968e3ba7c4
+MWB_PORTS=15100,15101
+SWB_PORTS=15200,15201
+BLOCK_PLATFORM_MWB_UPDATE=true
+PIN_BINARY_SETUP=PowerToysUserSetup-0.99.1-x64.exe

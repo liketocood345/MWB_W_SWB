@@ -1,45 +1,63 @@
-﻿# MWB + SWB
+# MWB+SWB
 
-External companion: Mouse Without Borders (MWB) + Sound Without Borders (SWB).
+## Disclaimer / 免责声明
 
-Does not modify PowerToys/MWB. Reads MWB peer matrix + SecurityKey, handshakes on LAN, then folds peer PCs into a stereo playback matrix over UDP.
+1. **AI-assisted / AI-written add-on modules.** Substantial parts of this repository (including Sound Synchro / SWB and related tooling) were produced or heavily assisted by AI. Use at your own risk.
+2. **For exchange and learning only.** Not a production-supported product; no liability for data loss or system damage (including overwrite/replace of Mouse Without Borders).
 
-## Requirements
+Upstream Mouse Without Borders remains Microsoft PowerToys (MIT).
 
-- Windows 10 / 11
-- .NET 8 Desktop Runtime
-- PowerToys Mouse Without Borders already paired
-- Firewall: TCP 15200, UDP 15201
+Mouse Without Borders **+** Sound Without Borders: keep full MWB behavior, then optionally add LAN stereo sync.
 
-## Use
+Design handbook lives **in this repo**: [docs/handbook/](docs/handbook/README.md).
 
-1. Run this app on each PC.
-2. Check **Sound Synchro**.
-3. App loads `%LOCALAPPDATA%\Microsoft\PowerToys\MouseWithoutBorders\settings.json`.
-4. HMAC handshake with the same SecurityKey (does not use MWB ports 15100/15101).
-5. Toggle peers in the matrix; optionally send local loopback and/or mix remote stereo to local speakers.
+## Upstream (pinned)
+
+| | |
+|--|--|
+| Upstream | https://github.com/microsoft/PowerToys |
+| Module | `src/modules/MouseWithoutBorders/` |
+| **Pin tag** | **v0.99.1** |
+| **Pin commit** | **184ccb75ec85cc799d04555f34ffae968e3ba7c4** |
+| License | MIT — Copyright (c) Microsoft Corporation |
+| Docs | https://learn.microsoft.com/windows/powertoys/mouse-without-borders |
+
+See [`UPSTREAM_PIN`](UPSTREAM_PIN) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). Mixed mesh with stock MWB must stay compatible with this pin generation. After install, **platform (PowerToys) MWB updates are blocked**.
+
+MWB+SWB is **not** an official Microsoft release.
+
+## Standalone MWB (Garage) vs PowerToys
+
+This track targets **Microsoft Garage Mouse without Borders** (standalone), matching the host machine. Do **not** replace or fight the host Garage install. PowerToys-merged MWB pin remains archived under endor/mwb-pin but Host no longer auto-launches it.
+
+VM test bed: H:\mwb-swb-vms\ (see README there).
+
+## Product contract (summary)
+
+- Installer **replaces** stock MWB (Path A) or does **fresh pin + auto-downgrade** (Path B); **inherits** SecurityKey / machine matrix.
+- Mixed mesh with **stock MWB**: MWB-only behavior; audio only when both sides have SWB and Sound Synchro is on.
+- SWB: **Sync only** / **2D ring** / **3D sphere** layout + optional **Force sound sync**; peer poses advertised over handshake (not reassigned on connect).
+- Details: [docs/handbook/01-REQUIREMENTS.md](docs/handbook/01-REQUIREMENTS.md).
+
+## Code status
+
+| Piece | Status |
+|-------|--------|
+| Design handbook `docs/handbook/` | In-repo |
+| Upstream pin | [`UPSTREAM_PIN`](UPSTREAM_PIN) (PowerToys MWB **v0.99.1**) |
+| `MwbSwb.Host` | Garage attachment Host + Sound Synchro UI |
+| `MwbSwb.Installer` | Consent UI, Path A/B, block PT MWB updates |
+| `MwbSwb.App` | Legacy SWB prototype (prefer Host) |
+
+Local `vendor/` / `dist/` trees are **not** published to GitHub (see `.gitignore`).
 
 ## Build
 
 ```powershell
 cd H:\mwb+swb
 dotnet build -c Release
-dotnet run --project src\MwbSwb.App -c Release
+dotnet run --project src\MwbSwb.Host -c Release
+dotnet run --project src\MwbSwb.Installer -c Release
 ```
 
-## Layout
-
-| Project | Role |
-|---------|------|
-| MwbSwb.Core | MWB settings + SWB control handshake |
-| MwbSwb.Audio | WASAPI loopback / mix / UDP stereo frames |
-| MwbSwb.App | Sound Synchro UI + matrix |
-
-## Notes
-
-- Reuses MWB machine identity and shared key only; does not speak MWB input protocol.
-- Audio is uncompressed stereo IEEE float (Opus later).
-
-## License
-
-MIT (this repo). Independent companion; not a Microsoft product.
+Windows 10/11 · .NET 8. SWB: TCP 15200 / UDP 15201. MWB remains 15100 / 15101.

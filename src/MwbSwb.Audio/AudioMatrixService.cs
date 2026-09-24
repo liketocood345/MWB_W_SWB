@@ -24,6 +24,10 @@ public sealed class AudioMatrixService : IAsyncDisposable
     private int _sampleRate = 48000;
     private bool _sendEnabled;
     private bool _recvEnabled = true;
+    private SoundSynchroSettings? _spatial;
+    private Func<string?, int>? _forceSyncDelayMs;
+    private readonly ConcurrentDictionary<string, (float left, float right)> _gains = new(StringComparer.OrdinalIgnoreCase);
+
 
     public event Action<string>? Log;
     public IReadOnlyDictionary<string, RemoteEndpoint> Remotes => _remotes;
@@ -42,6 +46,20 @@ public sealed class AudioMatrixService : IAsyncDisposable
         if (_remotes.TryGetValue(hostName, out var r))
             _remotes[hostName] = r with { IncludeInMatrix = include };
     }
+
+    public void SetForceSyncDelayProvider(Func<string?, int>? provider) => _forceSyncDelayMs = provider;
+
+    public void ApplySpatial(SoundSynchroSettings settings)
+    {
+        _spatial = settings;
+        _gains.Clear();
+        foreach (var pose in settings.Layout)
+            _gains[pose.HostName] = SpatialPan.Gains(pose, settings.DistanceAttenuation, settings.SpatialMode);
+        // ensure local machine pose exists for send-side awareness / advertise
+        settings.GetOrCreatePose(Environment.MachineName);
+        Log?.Invoke($"Spatial applied ({settings.SpatialMode}), attenuation={settings.DistanceAttenuation}, ForceSync={settings.ForceSoundSync}");
+    }
+
 
     public async Task StartAsync(int audioPort, int sampleRate = 48000, bool sendLocalLoopback = true, bool receiveAndMix = true)
     {
@@ -134,7 +152,7 @@ public sealed class AudioMatrixService : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                Log?.Invoke($"UDP → {remote.HostName}: {ex.Message}");
+                Log?.Invoke($"UDP -> {remote.HostName}: {ex.Message}");
             }
         }
     }
@@ -190,6 +208,14 @@ public sealed class AudioMatrixService : IAsyncDisposable
                 }
 
                 EnsureRxBuffer(host, sampleRate);
+                var delay = _forceSyncDelayMs?.Invoke(host) ?? 0;
+                if (delay > 0)
+                {
+                    delay = Math.Min(delay, 250);
+                    try { await Task.Delay(delay, ct).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { break; }
+                }
+                payload = ApplyGains(host, payload);
                 if (_rxBuffers.TryGetValue(host, out var buf))
                     buf.AddSamples(payload, 0, payload.Length);
             }
@@ -239,6 +265,31 @@ public sealed class AudioMatrixService : IAsyncDisposable
         if (len < 0 || 79 + len > buffer.Length) return false;
         payload = span.Slice(79, len).ToArray();
         return true;
+    }
+
+
+    private byte[] ApplyGains(string host, byte[] payload)
+    {
+        if (_spatial == null) return payload;
+        if (!_gains.TryGetValue(host, out var g))
+        {
+            var pose = _spatial.GetOrCreatePose(host);
+            g = SpatialPan.Gains(pose, _spatial.DistanceAttenuation, _spatial.SpatialMode);
+            _gains[host] = g;
+        }
+        if (Math.Abs(g.left - 1f) < 0.01f && Math.Abs(g.right - 1f) < 0.01f)
+            return payload;
+
+        var floats = new float[payload.Length / sizeof(float)];
+        Buffer.BlockCopy(payload, 0, floats, 0, payload.Length);
+        for (int i = 0; i + 1 < floats.Length; i += 2)
+        {
+            floats[i] *= g.left;
+            floats[i + 1] *= g.right;
+        }
+        var outBytes = new byte[payload.Length];
+        Buffer.BlockCopy(floats, 0, outBytes, 0, outBytes.Length);
+        return outBytes;
     }
 
     public async ValueTask DisposeAsync() => await StopAsync().ConfigureAwait(false);

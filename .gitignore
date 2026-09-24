@@ -12,3 +12,17 @@ project.assets.json
 *.nuget.g.props
 *.nuget.g.targets
 appsettings.*.local.json
+
+# Large local trees — pin metadata only in UPSTREAM_PIN
+vendor/
+dist/
+**/bin/
+**/obj/
+*.zip
+*.iso
+*.nupkg
+
+# Local scratch / one-off scripts
+tools/_*.py
+tools/_*.txt
+tools/_*.ps1
