@@ -34,9 +34,35 @@ public static class GarageMwbSettings
         return null;
     }
 
-    public static bool IsGarageProcessRunning() =>
-        System.Diagnostics.Process.GetProcessesByName("MouseWithoutBorders").Length > 0
-        || System.Diagnostics.Process.GetProcessesByName("MousewithoutBorders").Length > 0;
+    public static bool IsGarageProcessRunning()
+    {
+        try
+        {
+            if (System.Diagnostics.Process.GetProcessesByName("MouseWithoutBorders").Length > 0)
+                return true;
+            if (System.Diagnostics.Process.GetProcessesByName("MousewithoutBorders").Length > 0)
+                return true;
+            // Helper-only still means Garage MWB session is up on some installs.
+            if (System.Diagnostics.Process.GetProcessesByName("MousewithoutBordersHelper").Length > 0)
+                return true;
+            if (System.Diagnostics.Process.GetProcessesByName("MouseWithoutBordersHelper").Length > 0)
+                return true;
+            foreach (var p in System.Diagnostics.Process.GetProcesses())
+            {
+                try
+                {
+                    var n = p.ProcessName;
+                    if (n.Contains("MouseWithoutBorders", StringComparison.OrdinalIgnoreCase)
+                        || n.Contains("MousewithoutBorders", StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+                catch { /* access denied on some system procs */ }
+                finally { try { p.Dispose(); } catch { /* ignore */ } }
+            }
+        }
+        catch { /* ignore */ }
+        return false;
+    }
 
     public static MwbSettings LoadOrEmpty()
     {

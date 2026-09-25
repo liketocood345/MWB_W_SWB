@@ -9,7 +9,7 @@ Upstream Mouse Without Borders remains Microsoft PowerToys (MIT).
 
 Mouse Without Borders **+** Sound Without Borders: keep full MWB behavior, then optionally add LAN stereo sync.
 
-Design handbook lives **in this repo**: [docs/handbook/](docs/handbook/README.md).
+Design handbook lives **in this repo**: [docs/handbook/](docs/handbook/README.md) (chapters 00-08; Garage attachment = current default track).
 
 ## Upstream (pinned)
 

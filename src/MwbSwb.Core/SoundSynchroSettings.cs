@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace MwbSwb.Core;
@@ -24,10 +24,21 @@ public sealed class SoundSynchroSettings
     public const string RelativePath = @"Microsoft\MWB-SWB\SoundSynchro.json";
 
     public bool Enabled { get; set; }
+    /// <summary>Legacy; migrated into AudioTier on load (true -> 0).</summary>
     public bool ForceSoundSync { get; set; }
+    /// <summary>0 Force sync .. 6 Ultra-low. Default 3 Balanced.</summary>
+    public int AudioTier { get; set; } = 3;
     public SpatialLayoutMode SpatialMode { get; set; } = SpatialLayoutMode.Ring2D;
     public bool DistanceAttenuation { get; set; } = true;
     public int TargetSyncToleranceMs { get; set; } = 30;
+    /// <summary>Capture+send local loopback. Set false on RX-only probe hosts so LatencyProbe can open WASAPI loopback.</summary>
+    public bool SendLocalLoopback { get; set; } = true;
+    public bool ReceiveAndMix { get; set; } = true;
+    /// <summary>
+    /// Local playback target. Empty or "*" = all active render devices;
+    /// otherwise MMDevice.ID of a single endpoint.
+    /// </summary>
+    public string LocalPlaybackDeviceId { get; set; } = "*";
     public List<DeviceSpatialPose> Layout { get; set; } = new();
     public string SettingsPath { get; set; } = "";
 
@@ -38,12 +49,26 @@ public sealed class SoundSynchroSettings
     {
         path ??= DefaultPath;
         if (!File.Exists(path))
-            return new SoundSynchroSettings { SettingsPath = path, Enabled = false, ForceSoundSync = false };
+            return new SoundSynchroSettings { SettingsPath = path, Enabled = false, AudioTier = 3 };
 
         using var stream = File.OpenRead(path);
         var dto = JsonSerializer.Deserialize<SoundSynchroSettings>(stream, JsonOpts) ?? new SoundSynchroSettings();
         dto.SettingsPath = path;
+        dto.MigrateLegacyTier();
         return dto;
+    }
+
+    /// <summary>Old ForceSoundSync=true maps to tier 0 when AudioTier still default and flag set.</summary>
+    public void MigrateLegacyTier()
+    {
+        if (ForceSoundSync && AudioTier == 3)
+        {
+            // Ambiguous: could be fresh default. Prefer: if ForceSoundSync explicitly true in old files without AudioTier property,
+            // deserializer leaves AudioTier=3. Use ForceSoundSync as override once.
+            AudioTier = 0;
+            ForceSoundSync = false;
+        }
+        AudioTier = Math.Clamp(AudioTier, 0, 6);
     }
 
     public void Save()
@@ -53,13 +78,10 @@ public sealed class SoundSynchroSettings
         if (!string.IsNullOrEmpty(dir))
             Directory.CreateDirectory(dir);
         SettingsPath = path;
+        ForceSoundSync = AudioTier <= 2;
         File.WriteAllText(path, JsonSerializer.Serialize(this, JsonOptsWrite));
     }
 
-    /// <summary>
-    /// Local/default pose: front center. Never invent ring slots by connection order.
-    /// Remote peers should arrive via <see cref="UpsertAdvertisedPose"/>.
-    /// </summary>
     public DeviceSpatialPose GetOrCreatePose(string hostName)
     {
         var existing = Layout.FirstOrDefault(p =>
@@ -76,7 +98,6 @@ public sealed class SoundSynchroSettings
         return pose;
     }
 
-    /// <summary>Apply pose advertised by a peer machine (authoritative for that host).</summary>
     public DeviceSpatialPose UpsertAdvertisedPose(string hostName, double azimuthDeg, double elevationDeg, double radius)
     {
         var pose = GetOrCreatePose(hostName);
@@ -86,10 +107,7 @@ public sealed class SoundSynchroSettings
         return pose;
     }
 
-    public DeviceSpatialPose GetLocalPose(string localHostName)
-    {
-        return GetOrCreatePose(localHostName);
-    }
+    public DeviceSpatialPose GetLocalPose(string localHostName) => GetOrCreatePose(localHostName);
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {

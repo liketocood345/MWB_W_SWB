@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Net.Sockets;
 using System.Text;
 using MwbSwb.Core;
@@ -6,8 +6,8 @@ using MwbSwb.Core;
 namespace MwbSwb.Audio;
 
 /// <summary>
-/// LAN RTT calibration for ForceSoundSync.
-/// Slowest path is baseline; earlier-ready peers wait (playback delay).
+/// LAN RTT calibration for sync-leaning tiers (0-2).
+/// Slowest path is baseline; earlier peers get extra jitter watermark (not Task.Delay).
 /// </summary>
 public sealed class ForceSyncCalibrator
 {
@@ -17,7 +17,7 @@ public sealed class ForceSyncCalibrator
     public Dictionary<string, double> RttMsByHost { get; } = new(StringComparer.OrdinalIgnoreCase);
     public double MaxRttMs { get; private set; }
     public bool LastCalibrationOk { get; private set; }
-    public string? LastError { get; private set; }
+    public string? LastError { get; set; }
     public event Action<string>? Log;
 
     public async Task<bool> CalibrateAsync(IEnumerable<string> peerHosts, int baseUdpPort, CancellationToken ct = default)
@@ -46,12 +46,12 @@ public sealed class ForceSyncCalibrator
             if (RttMsByHost.Count == 0)
             {
                 LastError = "No peer answered ForceSync probes.";
-                Log?.Invoke(LastError + " Matrix stays available without forced alignment.");
+                Log?.Invoke(LastError + " No Δ — sticky local watermark hold only (no Task.Delay).");
                 return false;
             }
 
             LastCalibrationOk = true;
-            Log?.Invoke($"ForceSync baseline (slowest) = {MaxRttMs:F1} ms; target tolerance +/-{ToleranceMs} ms.");
+            Log?.Invoke($"ForceSync baseline (slowest) = {MaxRttMs:F1} ms; tolerance +/-{ToleranceMs} ms (sticky hold, not Task.Delay).");
             return true;
         }
         catch (Exception ex)
@@ -62,14 +62,20 @@ public sealed class ForceSyncCalibrator
         }
     }
 
-    public int GetPlaybackDelayMs(string? remoteHost = null)
+    /// <summary>Extra jitter watermark ms so this peer aligns to slowest path. Deadband = ToleranceMs.</summary>
+    public int GetWatermarkOffsetMs(string? remoteHost = null)
     {
         if (!LastCalibrationOk || MaxRttMs <= 0) return 0;
         double myPath = 0;
         if (!string.IsNullOrEmpty(remoteHost) && RttMsByHost.TryGetValue(remoteHost, out var r))
             myPath = r;
-        return (int)Math.Round(Math.Max(0, MaxRttMs - myPath));
+        var delta = Math.Max(0, MaxRttMs - myPath);
+        if (delta < ToleranceMs) return 0;
+        return (int)Math.Round(delta);
     }
+
+    /// <summary>Legacy name — same as watermark offset (no longer used as Task.Delay).</summary>
+    public int GetPlaybackDelayMs(string? remoteHost = null) => GetWatermarkOffsetMs(remoteHost);
 
     private static async Task<double> MeasureRttAsync(string host, int port, CancellationToken ct)
     {

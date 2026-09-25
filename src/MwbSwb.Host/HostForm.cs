@@ -8,6 +8,8 @@ namespace MwbSwb.Host;
 public sealed class HostForm : Form
 {
     private readonly NotifyIcon _tray = new();
+    private readonly SwbTrayIcon _trayGlyph = new();
+    private readonly System.Windows.Forms.Timer _trayMeter = new() { Interval = 200 };
     private readonly Label _status = new();
     private readonly TextBox _log = new();
     private readonly Button _btnOpenSwb = new();
@@ -20,14 +22,37 @@ public sealed class HostForm : Form
 
     public void SetOpenSwbOnStart(bool value) => _openSwbOnStart = value;
 
+    /// <summary>Hide tray first (avoid ghost icons), then exit message loop.</summary>
+    public void RequestGracefulExit()
+    {
+        if (IsDisposed) return;
+        if (InvokeRequired)
+        {
+            try { Invoke(RequestGracefulExit); } catch { /* shutting down */ }
+            return;
+        }
+        try { _trayMeter.Stop(); } catch { /* ignore */ }
+        try { _mwbWatch.Stop(); } catch { /* ignore */ }
+        try
+        {
+            _tray.Visible = false;
+            _tray.Icon = null;
+            _tray.Dispose();
+        }
+        catch { /* ignore */ }
+        try { Application.Exit(); } catch { /* ignore */ }
+    }
+
     public HostForm()
     {
         Text = "MWB+SWB Host";
         Width = 640;
         Height = 360;
         MinimumSize = new Size(520, 280);
-        StartPosition = FormStartPosition.CenterScreen;
+        StartPosition = FormStartPosition.Manual;
+        Location = new Point(-32000, -32000); // off-screen until user opens status
         Font = new Font("Segoe UI", 9f);
+        ShowInTaskbar = false;
 
         BuildUi();
         SetupTray();
@@ -35,16 +60,30 @@ public sealed class HostForm : Form
         Shown += (_, _) =>
         {
             AppendLog("Host started as MWB attachment (follows Garage Mouse without Borders).");
+            try
+            {
+                File.AppendAllText(@"C:\Users\Public\swb-enable.log",
+                    $"[{DateTime.Now:HH:mm:ss}] Host: Shown (tray){Environment.NewLine}");
+            }
+            catch { /* ignore */ }
             RefreshStatus();
             Hide();
             _mwbWatch.Tick += (_, _) => OnMwbWatchTick();
             _mwbWatch.Start();
             OnMwbWatchTick();
+            // If MWB already up at Host start, first tick may race; re-check once shortly after.
+            var once = new System.Windows.Forms.Timer { Interval = 2500 };
+            once.Tick += (_, _) =>
+            {
+                once.Stop();
+                once.Dispose();
+                OnMwbWatchTick();
+            };
+            once.Start();
             if (_openSwbOnStart)
             {
                 _openSwbOnStart = false;
-                // Defer so Hide/handle settle before opening SWB + enabling synchro.
-                BeginInvoke(RequestOpenSwb);
+                BeginInvoke(() => EnsureSwbAttachment(showWindow: true, enableSynchro: true));
             }
         };
 
@@ -54,13 +93,16 @@ public sealed class HostForm : Form
             {
                 e.Cancel = true;
                 Hide();
-                _tray.ShowBalloonTip(1500, "MWB+SWB", "Still running in the tray.", ToolTipIcon.Info);
+                ShowInTaskbar = false;
+                AppendLog("Host status hidden (still in tray).");
                 return;
             }
 
             await ShutdownAsync();
         };
     }
+
+    // tray hidden in ShutdownAsync before process tear-down (soft-restart safe)
 
     private void BuildUi()
     {
@@ -108,8 +150,8 @@ public sealed class HostForm : Form
 
     private void SetupTray()
     {
-        _tray.Text = "Mouse without Borders + SWB";
-        _tray.Icon = SystemIcons.Application;
+        _tray.Text = "SWB  RX: quiet  |  TX: quiet";
+        _tray.Icon = _trayGlyph.Idle;
         _tray.Visible = true;
         _tray.DoubleClick += (_, _) => OpenSwbWindow();
         var menu = new ContextMenuStrip();
@@ -117,14 +159,26 @@ public sealed class HostForm : Form
         openSwb.Font = new Font(openSwb.Font, FontStyle.Bold);
         menu.Items.Add(openSwb);
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Open Host status", null, (_, _) => { Show(); Activate(); });
-        menu.Items.Add("About", null, (_, _) => ShowAbout());
+        menu.Items.Add("Open Host status", null, (_, _) => ShowHostStatus());
+        menu.Items.Add("About (log)", null, (_, _) => ShowAbout());
         menu.Items.Add("Close SWB Host", null, async (_, _) =>
         {
             await ShutdownAsync();
             Application.Exit();
         });
         _tray.ContextMenuStrip = menu;
+
+        _trayMeter.Tick += (_, _) => OnTrayMeterTick();
+        _trayMeter.Start();
+    }
+
+    private void OnTrayMeterTick()
+    {
+        if (IsDisposed) return;
+        float tx = 0, rx = 0;
+        if (_swb != null && !_swb.IsDisposed)
+            _swb.TryGetAudioActivity(out tx, out rx);
+        _trayGlyph.TryUpdate(_tray, tx, rx);
     }
 
     private void OnMwbWatchTick()
@@ -132,20 +186,21 @@ public sealed class HostForm : Form
         var running = GarageMwbSettings.IsGarageProcessRunning();
         if (running && !_mwbWasRunning)
         {
-            AppendLog("Garage MWB detected - SWB attachment active.");
+            AppendLog("Garage MWB detected - SWB attachment + window (latency slider).");
+            try
+            {
+                File.AppendAllText(@"C:\Users\Public\swb-enable.log",
+                    $"[{DateTime.Now:HH:mm:ss}] Host: MWB detected -> EnsureSwbAttachment(showWindow=true){Environment.NewLine}");
+            }
+            catch { /* ignore */ }
+            // Enable mesh silently; do not pop SWB / balloons.
             if (!_userClosedSwb)
-                OpenSwbWindow(enableSynchro: true);
-            _tray.ShowBalloonTip(
-                3000,
-                "MWB + SWB",
-                "SWB attached to Mouse without Borders.",
-                ToolTipIcon.Info);
+                EnsureSwbAttachment(showWindow: true, enableSynchro: true);
         }
         else if (!running && _mwbWasRunning)
         {
             AppendLog("Garage MWB stopped - closing SWB attachment.");
             _ = CloseSwbOnlyAsync();
-            _tray.ShowBalloonTip(2000, "MWB + SWB", "MWB exited; SWB Host stopping.", ToolTipIcon.Info);
             _mwbWatch.Stop();
             BeginInvoke(async () =>
             {
@@ -191,35 +246,73 @@ public sealed class HostForm : Form
         }
         catch { /* ignore */ }
 
-        OpenSwbWindow(enableSynchro: true);
+        EnsureSwbAttachment(showWindow: true, enableSynchro: true);
+    }
+
+    private void ShowHostStatus()
+    {
+        ShowInTaskbar = true;
+        StartPosition = FormStartPosition.CenterScreen;
+        Location = new Point(
+            Math.Max(0, (Screen.PrimaryScreen!.WorkingArea.Width - Width) / 2),
+            Math.Max(0, (Screen.PrimaryScreen.WorkingArea.Height - Height) / 2));
+        Show();
+        Activate();
     }
 
     private void OpenSwbWindow(bool enableSynchro = false)
+        => EnsureSwbAttachment(showWindow: true, enableSynchro: enableSynchro);
+
+    /// <summary>
+    /// Create SWB attachment. Window only when <paramref name="showWindow"/> is true
+    /// (tray / Launch SWB). MWB attach path enables synchro headlessly.
+    /// </summary>
+    private void EnsureSwbAttachment(bool showWindow, bool enableSynchro)
     {
         if (!GarageMwbSettings.IsGarageProcessRunning())
         {
             AppendLog("MWB not running - SWB stays closed (attachment mode).");
-            _tray.ShowBalloonTip(2500, "MWB + SWB", "Start Garage Mouse without Borders first.", ToolTipIcon.Warning);
             return;
         }
 
-        _userClosedSwb = false;
+        if (showWindow)
+            _userClosedSwb = false;
+
         if (_swb == null || _swb.IsDisposed)
         {
             _swb = new SwbForm();
             _swb.FormClosed += (_, _) =>
             {
                 _userClosedSwb = true;
+                _swb = null;
                 AppendLog("SWB window closed by user (Host stays while MWB runs).");
             };
         }
 
-        _swb.Show();
-        _swb.WindowState = FormWindowState.Normal;
-        _swb.Activate();
+        // Force handle so Invoke/async enable works without flashing a window.
+        if (!_swb.IsHandleCreated)
+            _ = _swb.Handle;
+
         if (enableSynchro)
             _swb.EnsureSoundSynchroEnabled();
-        AppendLog("Opened SWB window (MWB attachment).");
+
+        if (showWindow)
+        {
+            _swb.RevealWindow();
+            AppendLog("Opened SWB window (MWB attachment).");
+            try
+            {
+                File.AppendAllText(@"C:\Users\Public\swb-enable.log",
+                    $"[{DateTime.Now:HH:mm:ss}] Opened SWB window show=true{Environment.NewLine}");
+            }
+            catch { /* ignore */ }
+        }
+        else
+            AppendLog("SWB attachment enabled (window hidden).");
+
+        // /open-swb and tray: always reveal even if synchro was already enabled headlessly.
+        if (showWindow && _swb != null && !_swb.IsDisposed)
+            _swb.RevealWindow();
     }
 
     private void RefreshStatus()
@@ -236,6 +329,7 @@ public sealed class HostForm : Form
     private async Task ShutdownAsync()
     {
         try { _mwbWatch.Stop(); } catch { /* ignore */ }
+        try { _trayMeter.Stop(); } catch { /* ignore */ }
         if (_swb != null && !_swb.IsDisposed)
         {
             await _swb.ShutdownAsync();
@@ -245,19 +339,14 @@ public sealed class HostForm : Form
         }
         _tray.Visible = false;
         _tray.Dispose();
+        _trayGlyph.Dispose();
+        _trayMeter.Dispose();
     }
 
-    private static void ShowAbout()
+    private void ShowAbout()
     {
-        MessageBox.Show(
-            "MWB+SWB Host (Garage track)\n\n" +
-            "- MWB first: keyboard/mouse via Garage Mouse without Borders.\n" +
-            "- SWB is an attachment: starts/stops with MWB; window can be closed manually.\n" +
-            "- Tray: open SWB window (only while MWB is running).\n" +
-            "- Ports: SWB TCP 15200 / UDP 15201 (not MWB 15100/15101).",
-            "About MWB+SWB",
-            MessageBoxButtons.OK,
-            MessageBoxIcon.Information);
+        ShowHostStatus();
+        AppendLog("About: MWB+SWB Host (Garage). MWB first; SWB attaches silently. Tray L=RX R=TX. Ports TCP 15200 / UDP 15201.");
     }
 
     private void AppendLog(string line)

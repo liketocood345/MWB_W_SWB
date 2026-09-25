@@ -7,11 +7,17 @@ obj/
 *.exe
 *.pdb
 *.cache
+*.obj
+*.exp
+*.lib
 project.assets.json
 *.nuget.dgspec.json
 *.nuget.g.props
 *.nuget.g.targets
 appsettings.*.local.json
+
+# Accidental empty redirect artifact
+=
 
 # Large local trees — pin metadata only in UPSTREAM_PIN
 vendor/
@@ -21,6 +27,9 @@ dist/
 *.zip
 *.iso
 *.nupkg
+
+# Ship prebuilt process-loopback native for win-x64 Host builds
+!src/MwbSwb.Audio/runtimes/win-x64/native/SwbProcessLoopback.dll
 
 # Local scratch / one-off scripts
 tools/_*.py

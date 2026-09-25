@@ -4,7 +4,7 @@ using NAudio.Wave.SampleProviders;
 namespace MwbSwb.Audio;
 
 /// <summary>
-/// Normalize any capture format to interleaved stereo IEEE-float (or PCM16) for LAN frames.
+/// Normalize any capture format to interleaved stereo IEEE-float at the matrix sample rate.
 /// </summary>
 public static class StereoPcmCodec
 {
@@ -18,6 +18,15 @@ public static class StereoPcmCodec
         if (samples.WaveFormat.Channels == 2)
             return samples;
         return new MultiplexingSampleProvider(new[] { samples }, TargetChannels);
+    }
+
+    /// <summary>Stereo float, resampled to <paramref name="targetSampleRate"/> when needed.</summary>
+    public static ISampleProvider ToStereoFloatAtRate(IWaveProvider source, int targetSampleRate)
+    {
+        var stereo = ToStereoFloat(source);
+        if (stereo.WaveFormat.SampleRate == targetSampleRate)
+            return stereo;
+        return new WdlResamplingSampleProvider(stereo, targetSampleRate);
     }
 
     public static WaveFormat StereoFloatFormat(int sampleRate) =>

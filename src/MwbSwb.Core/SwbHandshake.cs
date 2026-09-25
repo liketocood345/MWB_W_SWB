@@ -59,6 +59,13 @@ public sealed class SwbHandshakeService : IAsyncDisposable
         new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _probeInFlight =
         new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Hosts/IPs with completed full (audio) handshake.</summary>
+    private readonly long _startedTick = Environment.TickCount64;
+    private readonly ConcurrentDictionary<string, byte> _meshConfirmed =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, long> _logNotBefore =
+        new(StringComparer.OrdinalIgnoreCase);
+    private Task? _meshRetryLoop;
 
     public int ControlPort { get; }
     public int AudioPort { get; }
@@ -94,12 +101,14 @@ public sealed class SwbHandshakeService : IAsyncDisposable
         if (string.IsNullOrWhiteSpace(_mwb.SecurityKey))
             throw new InvalidOperationException("MWB SecurityKey missing. Configure Mouse Without Borders first.");
 
+        SwbFirewall.EnsureLanRules(msg => Log?.Invoke(msg));
         _listener = new TcpListener(IPAddress.Any, ControlPort);
         _listener.Start();
         Log?.Invoke($"SWB control listening on :{ControlPort} (audio UDP :{AudioPort})");
         _acceptLoop = Task.Run(() => AcceptLoopAsync(_cts.Token));
 
         StartDiscovery();
+        _meshRetryLoop = Task.Run(() => MeshRetryLoopAsync(_cts.Token));
         await Task.CompletedTask;
     }
 
@@ -145,6 +154,8 @@ public sealed class SwbHandshakeService : IAsyncDisposable
             return;
         }
 
+        // Full handshake at most once per peer IPv4 (hints may list host + IP).
+        var dialedIps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var target in candidates.ToList())
         {
             ct.ThrowIfCancellationRequested();
@@ -156,17 +167,39 @@ public sealed class SwbHandshakeService : IAsyncDisposable
 
                 RememberNamedPeer(named);
 
-                var info = await HandshakeAsClientAsync(named.HostName, IntentFull, ct).ConfigureAwait(false)
-                           ?? await HandshakeAsClientAsync(named.IpAddress, IntentFull, ct).ConfigureAwait(false);
+                var dialTarget = NormalizeIpString(!string.IsNullOrWhiteSpace(named.IpAddress) ? named.IpAddress : named.HostName);
+                if (IPAddress.TryParse(dialTarget, out var dip) && dip.AddressFamily == AddressFamily.InterNetwork)
+                {
+                    if (!dialedIps.Add(dialTarget))
+                        continue;
+                }
+                else if (!string.IsNullOrWhiteSpace(named.IpAddress)
+                         && IPAddress.TryParse(named.IpAddress, out var nip)
+                         && nip.AddressFamily == AddressFamily.InterNetwork)
+                {
+                    dialTarget = NormalizeIpString(named.IpAddress);
+                    if (!dialedIps.Add(dialTarget))
+                        continue;
+                }
+
+                if (!ShouldInitiateDial(dialTarget))
+                {
+                    LogRare($"dial-yield:{dialTarget}", $"Dial yield -> {dialTarget}; waiting inbound");
+                    continue;
+                }
+                var info = !string.IsNullOrWhiteSpace(named.IpAddress)
+                    ? await HandshakeAsClientAsync(named.IpAddress, IntentFull, ct).ConfigureAwait(false)
+                    : await HandshakeAsClientAsync(named.HostName, IntentFull, ct).ConfigureAwait(false);
                 if (info != null)
                 {
+                    MarkMeshConfirmed(info);
                     PeerConfirmed?.Invoke(info);
-                    Log?.Invoke($"Handshake OK → {info.HostName} ({info.IpAddress}) stereo={info.StereoOk}");
+                    LogRare($"hs-ok:{info.HostName}", $"Handshake OK -> {info.HostName} ({info.IpAddress}) stereo={info.StereoOk}");
                 }
             }
             catch (Exception ex)
             {
-                Log?.Invoke($"Handshake fail → {target}: {ex.Message}");
+                Log?.Invoke($"Handshake fail -> {target}: {ex.Message}");
             }
         }
     }
@@ -210,12 +243,12 @@ public sealed class SwbHandshakeService : IAsyncDisposable
 
             var err = reply.Value.TryGetProperty("error", out var e) ? e.GetString() : null;
             var remoteHost = reply.Value.TryGetProperty("host", out var h) ? h.GetString() : null;
-            var ip = (client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? hostOrIp;
+            var ip = NormalizeIpString((client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? hostOrIp);
 
             if (string.Equals(err, IntentNameProbe, StringComparison.OrdinalIgnoreCase)
                 && !string.IsNullOrWhiteSpace(remoteHost))
             {
-                Log?.Invoke($"Name-probe OK ← {remoteHost} @ {ip} (same key, reject-connect)");
+                LogRare($"np-ok:{remoteHost}", $"Name-probe OK <- {remoteHost} @ {ip} (same key, reject-connect)");
                 var (az, el, rad) = ReadPose(reply);
                 return new SwbPeerInfo(remoteHost!, ip, ControlPort, AudioPort, SwbPeerRole.Both, SampleRate, Channels, Channels >= 2, az, el, rad);
             }
@@ -295,7 +328,7 @@ public sealed class SwbHandshakeService : IAsyncDisposable
                     return;
                 }
 
-                var ip = (client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? "";
+                var ip = NormalizeIpString((client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? "");
 
                 // Same key → actively reject name-probe and disclose local device/host name.
                 if (string.Equals(intent, IntentNameProbe, StringComparison.OrdinalIgnoreCase))
@@ -314,7 +347,7 @@ public sealed class SwbHandshakeService : IAsyncDisposable
                     }, ct).ConfigureAwait(false);
                     if (!string.IsNullOrWhiteSpace(ip))
                         _endpointHints[ip] = remoteHost;
-                    Log?.Invoke($"Name-probe reject → disclosed host={_mwb.LocalHostName} to {remoteHost}");
+                    LogRare($"np-rej:{remoteHost}", $"Name-probe reject -> disclosed host={_mwb.LocalHostName} to {remoteHost}");
                     return;
                 }
 
@@ -339,9 +372,11 @@ public sealed class SwbHandshakeService : IAsyncDisposable
                 }, ct).ConfigureAwait(false);
 
                 var (raz, rel, rrad) = ReadPose(hello);
-                PeerConfirmed?.Invoke(new SwbPeerInfo(
-                    remoteHost, ip, ControlPort, AudioPort, SwbPeerRole.Both, SampleRate, Channels, Channels >= 2, raz, rel, rrad));
-                Log?.Invoke($"Peer confirmed (inbound): {remoteHost}");
+                var inbound = new SwbPeerInfo(
+                    remoteHost, ip, ControlPort, AudioPort, SwbPeerRole.Both, SampleRate, Channels, Channels >= 2, raz, rel, rrad);
+                MarkMeshConfirmed(inbound);
+                PeerConfirmed?.Invoke(inbound);
+                LogRare($"hs-in:{remoteHost}", $"Peer confirmed (inbound): {remoteHost} @ {ip}");
             }
             catch (Exception ex)
             {
@@ -395,7 +430,7 @@ public sealed class SwbHandshakeService : IAsyncDisposable
         var sampleRate = reply.Value.TryGetProperty("sampleRate", out var sr) ? sr.GetInt32() : SampleRate;
         var channels = reply.Value.TryGetProperty("channels", out var ch) ? (short)ch.GetInt32() : Channels;
         var stereoOk = reply.Value.TryGetProperty("stereoOk", out var st) ? st.GetBoolean() : channels >= 2;
-        var ip = (client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? host;
+        var ip = NormalizeIpString((client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? host);
 
         var (caz, cel, crad) = ReadPose(reply);
         return new SwbPeerInfo(remoteHost, ip, ControlPort, audioPort, SwbPeerRole.Both, sampleRate, channels, stereoOk, caz, cel, crad);
@@ -418,22 +453,25 @@ public sealed class SwbHandshakeService : IAsyncDisposable
                 if (string.IsNullOrWhiteSpace(remoteHost)
                     || remoteHost.Equals(_mwb.LocalHostName, StringComparison.OrdinalIgnoreCase))
                     continue;
-                var ip = result.RemoteEndPoint.Address.ToString();
+                var ip = NormalizeIpString(result.RemoteEndPoint.Address.ToString());
                 if (IPAddress.IsLoopback(result.RemoteEndPoint.Address))
                     continue;
                 // Beacon only supplies IP candidates; hostname confirmed by same-key name-probe reject.
                 var isNew = !_endpointHints.ContainsKey(ip);
-                _endpointHints[ip] = ip;
-                Log?.Invoke($"Discovery beacon from {remoteHost} @ {ip}");
+                if (!_endpointHints.ContainsKey(ip) || string.Equals(_endpointHints[ip], ip, StringComparison.OrdinalIgnoreCase))
+                    _endpointHints[ip] = remoteHost;
+                // Log at most once per IP (no periodic beacon spam).
                 if (isNew)
-                    _ = Task.Run(() => ProbeNewEndpointAsync(ip, _cts.Token));
+                    Log?.Invoke($"Discovery peer seen: {remoteHost} @ {ip}");
+                // Do NOT probe on every beacon — dual-dial storms caused alternating one-way mesh.
+                // MeshRetryLoop + DiscoverAndConnect own outbound dials (with dial ownership).
             }
             catch (OperationCanceledException) { break; }
             catch (ObjectDisposedException) { break; }
             catch (Exception ex)
             {
-                Log?.Invoke($"Discovery recv: {ex.Message}");
-                try { await Task.Delay(500, ct).ConfigureAwait(false); } catch { break; }
+                LogRare($"disc-recv:{ex.Message}", $"Discovery recv: {ex.Message}");
+                try { await Task.Delay(5000, ct).ConfigureAwait(false); } catch { break; }
             }
         }
     }
@@ -456,10 +494,10 @@ public sealed class SwbHandshakeService : IAsyncDisposable
             catch (ObjectDisposedException) { break; }
             catch (Exception ex)
             {
-                Log?.Invoke($"Discovery announce: {ex.Message}");
+                LogRare($"disc-ann:{ex.Message}", $"Discovery announce: {ex.Message}");
             }
 
-            try { await Task.Delay(2000, ct).ConfigureAwait(false); } catch { break; }
+            try { await Task.Delay(5000, ct).ConfigureAwait(false); } catch { break; }
         }
     }
 
@@ -501,9 +539,11 @@ public sealed class SwbHandshakeService : IAsyncDisposable
         PeerNamed?.Invoke(named);
     }
 
-    private async Task ProbeNewEndpointAsync(string hostOrIp, CancellationToken ct)
+    private async Task ProbeNewEndpointAsync(string hostOrIp, CancellationToken ct, bool forceDial = false)
     {
         if (string.IsNullOrWhiteSpace(hostOrIp))
+            return;
+        if (_meshConfirmed.ContainsKey(hostOrIp))
             return;
         if (!_probeInFlight.TryAdd(hostOrIp, 0))
             return;
@@ -516,23 +556,31 @@ public sealed class SwbHandshakeService : IAsyncDisposable
 
             try
             {
-                var info = await HandshakeAsClientAsync(named.HostName, IntentFull, ct).ConfigureAwait(false)
-                           ?? await HandshakeAsClientAsync(named.IpAddress, IntentFull, ct).ConfigureAwait(false);
+                var dialTarget = NormalizeIpString(!string.IsNullOrWhiteSpace(named.IpAddress) ? named.IpAddress : named.HostName);
+                if (!forceDial && !ShouldInitiateDial(dialTarget))
+                {
+                    LogRare($"dial-yield:{dialTarget}", $"Dial yield (peer owns outbound) -> {dialTarget}; waiting inbound full handshake");
+                    return;
+                }
+                var info = !string.IsNullOrWhiteSpace(named.IpAddress)
+                    ? await HandshakeAsClientAsync(named.IpAddress, IntentFull, ct).ConfigureAwait(false)
+                    : await HandshakeAsClientAsync(named.HostName, IntentFull, ct).ConfigureAwait(false);
                 if (info != null)
                 {
+                    MarkMeshConfirmed(info);
                     PeerConfirmed?.Invoke(info);
-                    Log?.Invoke($"Handshake OK → {info.HostName} ({info.IpAddress}) stereo={info.StereoOk}");
+                    LogRare($"hs-ok:{info.HostName}", $"Handshake OK -> {info.HostName} ({info.IpAddress}) stereo={info.StereoOk}");
                 }
             }
             catch (Exception ex)
             {
-                Log?.Invoke($"Handshake fail → {named.HostName}: {ex.Message}");
+                Log?.Invoke($"Handshake fail -> {named.HostName}: {ex.Message}");
             }
         }
         catch (OperationCanceledException) { /* ignore */ }
         catch (Exception ex)
         {
-            Log?.Invoke($"Beacon name-probe → {hostOrIp}: {ex.Message}");
+            Log?.Invoke($"Beacon name-probe -> {hostOrIp}: {ex.Message}");
         }
         finally
         {
@@ -540,6 +588,132 @@ public sealed class SwbHandshakeService : IAsyncDisposable
         }
     }
 
+
+    private void MarkMeshConfirmed(SwbPeerInfo info)
+    {
+        if (!string.IsNullOrWhiteSpace(info.HostName))
+            _meshConfirmed[info.HostName] = 0;
+        if (!string.IsNullOrWhiteSpace(info.IpAddress))
+            _meshConfirmed[info.IpAddress] = 0;
+        if (!string.IsNullOrWhiteSpace(info.IpAddress) && !string.IsNullOrWhiteSpace(info.HostName))
+            _endpointHints[info.IpAddress] = info.HostName;
+    }
+
+    /// <summary>Suppress duplicate logs; minimum interval 15s (never 1s cyclic refresh).</summary>
+    private void LogRare(string key, string message, double minIntervalSec = 15)
+    {
+        var now = Environment.TickCount64;
+        var gateMs = (long)(minIntervalSec * 1000);
+        if (_logNotBefore.TryGetValue(key, out var notBefore) && now < notBefore)
+            return;
+        _logNotBefore[key] = now + gateMs;
+        Log?.Invoke(message);
+    }
+
+    private async Task MeshRetryLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try { await Task.Delay(12000, ct).ConfigureAwait(false); } catch { break; }
+            foreach (var kv in _endpointHints.ToArray())
+            {
+                if (ct.IsCancellationRequested) break;
+                var ipKey = NormalizeIpString(kv.Key);
+                if (!IPAddress.TryParse(ipKey, out var addr) || addr.AddressFamily != AddressFamily.InterNetwork)
+                    continue; // hostname keys / non-v4 skipped
+                if (_meshConfirmed.ContainsKey(ipKey) || _meshConfirmed.ContainsKey(kv.Key) || _meshConfirmed.ContainsKey(kv.Value))
+                    continue;
+                if (!ShouldInitiateDial(ipKey))
+                {
+                    // Asymmetric start: owner may already MarkMeshConfirmed against a dying peer.
+                    // After 20s uptime, non-owner may dial once so inbound side can still join.
+                    if (Environment.TickCount64 - _startedTick < 20_000)
+                        continue;
+                    LogRare($"mesh-fallback:{ipKey}", $"Mesh fallback dial (unconfirmed yield) -> {ipKey}", 30);
+                    _ = ProbeNewEndpointAsync(ipKey, ct, forceDial: true);
+                    continue;
+                }
+                LogRare($"mesh-retry:{ipKey}", $"Mesh retry (dial-owner) -> {ipKey}", 30);
+                _ = ProbeNewEndpointAsync(ipKey, ct);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Exactly one side dials full handshake to avoid mutual connect races
+    /// that flipped one-way audio/control every few seconds.
+    /// Owner = lexicographically smaller of (localHost, peerIpOrHost).
+    /// </summary>
+    private bool ShouldInitiateDial(string peerIpOrHost)
+    {
+        var local = _mwb.LocalHostName ?? Environment.MachineName;
+        // Prefer comparing local primary IPv4 vs peer IP when peer is IP.
+        // TcpClient often reports IPv4-mapped IPv6 (::ffff:a.b.c.d) — map before compare
+        // or BOTH sides yield and nobody completes full handshake.
+        if (IPAddress.TryParse(peerIpOrHost, out var peerAddr))
+        {
+            if (peerAddr.IsIPv4MappedToIPv6)
+                peerAddr = peerAddr.MapToIPv4();
+            if (peerAddr.AddressFamily == AddressFamily.InterNetwork)
+            {
+                var localIp = TryGetPreferredLocalIPv4();
+                if (localIp != null)
+                {
+                    var a = localIp.GetAddressBytes();
+                    var b = peerAddr.GetAddressBytes();
+                    for (var i = 0; i < 4; i++)
+                    {
+                        if (a[i] < b[i]) return true;
+                        if (a[i] > b[i]) return false;
+                    }
+                    return string.Compare(local, peerIpOrHost, StringComparison.OrdinalIgnoreCase) < 0;
+                }
+            }
+        }
+        return string.Compare(local, peerIpOrHost, StringComparison.OrdinalIgnoreCase) < 0;
+    }
+
+    /// <summary>Normalize endpoint IP to dotted IPv4 when possible.</summary>
+    private static string NormalizeIpString(string? ip)
+    {
+        if (string.IsNullOrWhiteSpace(ip)) return ip ?? "";
+        if (!IPAddress.TryParse(ip, out var addr)) return ip;
+        if (addr.IsIPv4MappedToIPv6)
+            addr = addr.MapToIPv4();
+        return addr.ToString();
+    }
+
+    private static IPAddress? TryGetPreferredLocalIPv4()
+    {
+        try
+        {
+            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (nic.OperationalStatus != OperationalStatus.Up) continue;
+                if (nic.NetworkInterfaceType is NetworkInterfaceType.Loopback) continue;
+                foreach (var ua in nic.GetIPProperties().UnicastAddresses)
+                {
+                    if (ua.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                    if (IPAddress.IsLoopback(ua.Address)) continue;
+                    // Prefer 192.168.150.x host-only lab range when present
+                    var s = ua.Address.ToString();
+                    if (s.StartsWith("192.168.150.", StringComparison.Ordinal))
+                        return ua.Address;
+                }
+            }
+            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (nic.OperationalStatus != OperationalStatus.Up) continue;
+                foreach (var ua in nic.GetIPProperties().UnicastAddresses)
+                {
+                    if (ua.Address.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(ua.Address))
+                        return ua.Address;
+                }
+            }
+        }
+        catch { /* ignore */ }
+        return null;
+    }
     public static string ComputeToken(string securityKey, string nonce, string host, string side)
     {
         var material = $"{nonce}|{host}|{side}|SWB";
@@ -616,6 +790,10 @@ public sealed class SwbHandshakeService : IAsyncDisposable
         if (_discoveryAnnounce != null)
         {
             try { await _discoveryAnnounce.ConfigureAwait(false); } catch { /* ignore */ }
+        }
+        if (_meshRetryLoop != null)
+        {
+            try { await _meshRetryLoop.ConfigureAwait(false); } catch { /* ignore */ }
         }
         _cts.Dispose();
     }

@@ -15,3 +15,7 @@
 2. Never enable PowerToys MouseWithoutBorders on the host while Garage is in use.
 3. All MWB+SWB program verification happens **only inside VMs** under `H:\mwb-swb-vms\`.
 4. VM guests install Garage MSI from `H:\mwb-swb-vms\payload\MouseWithoutBordersSetup.msi` + SWB Host package; do not use PowerToys MWB pin there unless a future design explicitly switches (not this track).
+
+## Handbook
+
+See design handbook [07-GARAGE-ATTACHMENT](handbook/07-GARAGE-ATTACHMENT.md) and [08-VM-TESTBED](handbook/08-VM-TESTBED.md).

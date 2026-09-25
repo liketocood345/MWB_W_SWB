@@ -2,10 +2,14 @@ using NAudio.CoreAudioApi;
 
 namespace MwbSwb.Audio;
 
-/// <summary>Default local render endpoint for SWB matrix (visible even with zero peers).</summary>
+/// <summary>Local render endpoints for SWB matrix + playback device picker.</summary>
 public static class LocalAudioDeviceInfo
 {
     public const string LocalMatrixTag = "local";
+    /// <summary>Sentinel for "All devices" in SoundSynchroSettings.LocalPlaybackDeviceId.</summary>
+    public const string AllDevicesId = "*";
+
+    public readonly record struct RenderEndpoint(string Id, string FriendlyName);
 
     public static string GetDefaultRenderFriendlyName()
     {
@@ -28,4 +32,31 @@ public static class LocalAudioDeviceInfo
         var device = GetDefaultRenderFriendlyName();
         return $"{machineName} / {device}";
     }
+
+    public static IReadOnlyList<RenderEndpoint> ListActiveRenderEndpoints()
+    {
+        var list = new List<RenderEndpoint>();
+        try
+        {
+            using var enumerator = new MMDeviceEnumerator();
+            foreach (var d in enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
+            {
+                using (d)
+                {
+                    var id = d.ID?.Trim() ?? "";
+                    var name = d.FriendlyName?.Trim();
+                    if (string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(name)) continue;
+                    list.Add(new RenderEndpoint(id, name));
+                }
+            }
+        }
+        catch
+        {
+            /* empty */
+        }
+        return list;
+    }
+
+    public static bool IsAllDevices(string? deviceId) =>
+        string.IsNullOrWhiteSpace(deviceId) || deviceId.Trim() == AllDevicesId;
 }

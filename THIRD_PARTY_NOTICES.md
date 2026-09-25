@@ -16,6 +16,10 @@ Mixed mesh with stock MWB peers requires protocol compatibility with this pin ge
 - Package: NAudio (WASAPI capture/playback)
 - License: MIT
 
+## Tray glyph
+
+SWB notify-icon speakers are **original GDI+ drawings** inspired by the common OS volume/speaker silhouette (Win10-like cone + wave arcs). They are **not** Microsoft Segoe MDL2 / Windows shell assets.
+
 ## Other
 
 See LICENSE for this repository (MIT).
