@@ -6,8 +6,6 @@ namespace MwbSwb.SetupBoot;
 
 /// <summary>
 /// Double-click installer: extracts embedded payload.zip and runs Install.cmd.
-/// If MWB is running, Install.cmd waits for it to close before Garage overwrite,
-/// then relaunches MWB + SWB Host so SWB attach/connect still happens.
 /// </summary>
 static class Program
 {
@@ -20,7 +18,7 @@ static class Program
 
         using var ui = new StatusForm();
         ui.Show();
-        ui.SetStatus("Preparing install…");
+        ui.SetStatus("Preparing install...");
         Application.DoEvents();
 
         string? work = null;
@@ -32,7 +30,7 @@ static class Program
             work = Path.Combine(Path.GetTempPath(), "MWB-SWB-Setup-" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(work);
 
-            ui.SetStatus("Unpacking install files…");
+            ui.SetStatus("Unpacking install files...");
             Application.DoEvents();
             ExtractEmbeddedPayload(work);
 
@@ -40,7 +38,7 @@ static class Program
             if (!File.Exists(installCmd))
                 throw new FileNotFoundException("Install.cmd missing inside payload.", installCmd);
 
-            ui.SetStatus("Installing…");
+            ui.SetStatus("Installing...");
             Application.DoEvents();
 
             var psi = new ProcessStartInfo
@@ -75,10 +73,7 @@ static class Program
                 ui.SetStatus($"Install finished with exit code {proc.ExitCode}.");
                 MessageBox.Show(
                     $"Setup finished with exit code {proc.ExitCode}.\n\n" +
-                    "If Windows Defender / SmartScreen blocked a file, click Allow / Unblock,\n" +
-                    "then run MWB-SWB-Setup.exe again.\n\n" +
-                    "Install steps wait up to ~15 minutes for Defender prompts.\n" +
-                    "See %TEMP%\\mwb-swb-setup.log and %TEMP%\\mwb-swb-setup-status.txt.",
+                    "See %TEMP%\\mwb-swb-setup.log",
                     "MWB+SWB Setup",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Warning);
@@ -155,7 +150,7 @@ sealed class StatusForm : Form
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleCenter,
             Font = new Font("Segoe UI", 10.5f),
-            Text = "Starting…",
+            Text = "Starting...",
             Padding = new Padding(12),
         };
         Controls.Add(_label);

@@ -27,6 +27,7 @@ dist/
 *.zip
 *.iso
 *.nupkg
+*.msi
 
 # Ship prebuilt process-loopback native for win-x64 Host builds
 !src/MwbSwb.Audio/runtimes/win-x64/native/SwbProcessLoopback.dll
@@ -34,7 +35,30 @@ dist/
 # SetupBoot embeds this only during build-payload
 src/MwbSwb.SetupBoot/payload.zip
 
-# Local scratch / one-off scripts
+# Local scratch / one-off scripts / session notes
 tools/_*.py
 tools/_*.txt
 tools/_*.ps1
+record/
+
+# VM testbed (lives outside this repo; never publish artifacts)
+**/mwb-swb-vms/
+**/*.vhd
+**/*.vhdx
+**/*.vmdk
+**/*.ova
+**/*.vmx
+**/*.vmxf
+**/*.vmsd
+**/*.vmem
+**/*.nvram
+
+# Unmodified / upstream MWB dumps (only our wrap tools + patched notes belong in git)
+vendor/mwb-pin/
+vendor/mwb-garage/
+**/MouseWithoutBordersSetup.msi
+**/MouseWithoutBorders.exe
+**/MouseWithoutBorders.original.exe
+**/MouseWithoutBorders.patched.exe
+**/MouseWithoutBordersHelper.exe
+**/MouseWithoutBordersSvc.exe

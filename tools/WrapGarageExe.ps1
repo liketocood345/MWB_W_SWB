@@ -30,17 +30,22 @@ Get-Process -Name 'MouseWithoutBorders','MouseWithoutBorders.original','MouseWit
 Stop-Service -Name 'MouseWithoutBordersSvc' -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
 
-function Copy-Retry([string]$From, [string]$To, [int]$Tries = 36, [int]$SleepSec = 5) {
+function Copy-Retry([string]$From, [string]$To, [int]$Tries = 8, [int]$SleepSec = 2) {
   for ($i = 1; $i -le $Tries; $i++) {
     try {
       Copy-Item -LiteralPath $From -Destination $To -Force -ErrorAction Stop
       return
     } catch {
-      Write-Warning "Copy blocked (attempt $i/$Tries) — allow Windows Defender if prompted: $($_.Exception.Message)"
+      Write-LogSoft "copy-retry $i/$Tries $($_.Exception.Message)"
       if ($i -eq $Tries) { throw }
       Start-Sleep -Seconds $SleepSec
     }
   }
+}
+function Write-LogSoft([string]$msg) {
+  try {
+    Add-Content -Path (Join-Path $env:TEMP 'mwb-swb-setup.log') -Value ("[{0}] wrap {1}" -f (Get-Date -Format 'HH:mm:ss'), $msg) -Encoding UTF8
+  } catch { }
 }
 
 try {
