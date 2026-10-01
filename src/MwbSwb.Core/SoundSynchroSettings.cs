@@ -11,6 +11,17 @@ public enum SpatialLayoutMode
     SyncOnly = 2,
 }
 
+/// <summary>Mesh-replicated SWB UI settings (not per-device playback id / poses).</summary>
+public sealed record SwbMeshSettings(
+    long Epoch,
+    int AudioTier,
+    int SpatialMode,
+    bool DistanceAttenuation,
+    bool SendLocalLoopback,
+    bool ReceiveAndMix,
+    bool Enabled,
+    int TargetSyncToleranceMs);
+
 public sealed class DeviceSpatialPose
 {
     public string HostName { get; set; } = "";
@@ -41,6 +52,8 @@ public sealed class SoundSynchroSettings
     public string LocalPlaybackDeviceId { get; set; } = "*";
     public List<DeviceSpatialPose> Layout { get; set; } = new();
     public string SettingsPath { get; set; } = "";
+    /// <summary>Utc ticks of last intentional mesh-relevant change; last-writer-wins across devices.</summary>
+    public long SettingsEpoch { get; set; }
 
     public static string DefaultPath =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), RelativePath);
@@ -55,6 +68,8 @@ public sealed class SoundSynchroSettings
         var dto = JsonSerializer.Deserialize<SoundSynchroSettings>(stream, JsonOpts) ?? new SoundSynchroSettings();
         dto.SettingsPath = path;
         dto.MigrateLegacyTier();
+        if (dto.SettingsEpoch <= 0)
+            dto.SettingsEpoch = 1;
         return dto;
     }
 
@@ -71,7 +86,7 @@ public sealed class SoundSynchroSettings
         AudioTier = Math.Clamp(AudioTier, 0, 6);
     }
 
-    public void Save()
+    public void Save(bool bumpEpoch = true)
     {
         var path = string.IsNullOrWhiteSpace(SettingsPath) ? DefaultPath : SettingsPath;
         var dir = Path.GetDirectoryName(path);
@@ -79,8 +94,38 @@ public sealed class SoundSynchroSettings
             Directory.CreateDirectory(dir);
         SettingsPath = path;
         ForceSoundSync = AudioTier <= 2;
+        if (bumpEpoch)
+            SettingsEpoch = Math.Max(SettingsEpoch + 1, DateTime.UtcNow.Ticks);
         File.WriteAllText(path, JsonSerializer.Serialize(this, JsonOptsWrite));
     }
+
+    /// <summary>Apply mesh-synced fields from a peer when remote epoch is newer. Returns true if applied.</summary>
+    public bool TryApplyMeshSettings(SwbMeshSettings remote)
+    {
+        if (remote.Epoch <= SettingsEpoch)
+            return false;
+        Enabled = remote.Enabled;
+        AudioTier = Math.Clamp(remote.AudioTier, 0, 6);
+        SpatialMode = (SpatialLayoutMode)Math.Clamp(remote.SpatialMode, 0, 2);
+        DistanceAttenuation = remote.DistanceAttenuation;
+        SendLocalLoopback = remote.SendLocalLoopback;
+        ReceiveAndMix = remote.ReceiveAndMix;
+        TargetSyncToleranceMs = Math.Clamp(remote.TargetSyncToleranceMs, 5, 200);
+        SettingsEpoch = remote.Epoch;
+        ForceSoundSync = AudioTier <= 2;
+        Save(bumpEpoch: false);
+        return true;
+    }
+
+    public SwbMeshSettings ToMeshSettings() => new(
+        SettingsEpoch,
+        Math.Clamp(AudioTier, 0, 6),
+        (int)SpatialMode,
+        DistanceAttenuation,
+        SendLocalLoopback,
+        ReceiveAndMix,
+        Enabled,
+        TargetSyncToleranceMs);
 
     public DeviceSpatialPose GetOrCreatePose(string hostName)
     {

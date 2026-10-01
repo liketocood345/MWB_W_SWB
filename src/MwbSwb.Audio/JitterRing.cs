@@ -174,11 +174,13 @@ public sealed class JitterRing
             dest.Clear();
             return;
         }
-        for (var i = 0; i < dest.Length; i++)
+        // One-shot fade-out of the last good frame. Do NOT write faded samples back into
+        // _lastFrame — recursive 0.85× recycle caused severe metallic / digital distortion.
+        var len = dest.Length;
+        for (var i = 0; i < len; i++)
         {
-            var v = _lastFrame[i % _lastFrameLen] * 0.85f;
-            dest[i] = v;
-            _lastFrame[i % _lastFrameLen] = v;
+            var env = 1f - (float)i / Math.Max(1, len);
+            dest[i] = _lastFrame[i % _lastFrameLen] * (0.35f * env);
         }
     }
 }

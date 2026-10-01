@@ -31,6 +31,9 @@ dist/
 # Ship prebuilt process-loopback native for win-x64 Host builds
 !src/MwbSwb.Audio/runtimes/win-x64/native/SwbProcessLoopback.dll
 
+# SetupBoot embeds this only during build-payload
+src/MwbSwb.SetupBoot/payload.zip
+
 # Local scratch / one-off scripts
 tools/_*.py
 tools/_*.txt

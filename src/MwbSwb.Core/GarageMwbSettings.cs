@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using Microsoft.Win32;
 
 namespace MwbSwb.Core;
@@ -38,27 +40,80 @@ public static class GarageMwbSettings
     {
         try
         {
-            if (System.Diagnostics.Process.GetProcessesByName("MouseWithoutBorders").Length > 0)
+            // Wrapped install: real UI is MouseWithoutBorders.original.exe
+            if (System.Diagnostics.Process.GetProcessesByName("MouseWithoutBorders.original").Length > 0)
                 return true;
-            if (System.Diagnostics.Process.GetProcessesByName("MousewithoutBorders").Length > 0)
-                return true;
+
             // Helper-only still means Garage MWB session is up on some installs.
             if (System.Diagnostics.Process.GetProcessesByName("MousewithoutBordersHelper").Length > 0)
                 return true;
             if (System.Diagnostics.Process.GetProcessesByName("MouseWithoutBordersHelper").Length > 0)
                 return true;
+
+            // Unwrapped / stock: process name MouseWithoutBorders.
+            // When MWB+SWB stub wraps the exe, stub is ALSO named MouseWithoutBorders —
+            // ignore stub by requiring path not equal to the wrap stub next to .original.exe.
+            foreach (var p in System.Diagnostics.Process.GetProcessesByName("MouseWithoutBorders"))
+            {
+                try
+                {
+                    string? path = null;
+                    try { path = p.MainModule?.FileName; } catch { /* access denied */ }
+                    if (IsMwbSwbLaunchStub(path))
+                        continue;
+                    return true;
+                }
+                catch { /* ignore */ }
+                finally { try { p.Dispose(); } catch { /* ignore */ } }
+            }
+
+            if (System.Diagnostics.Process.GetProcessesByName("MousewithoutBorders").Length > 0)
+                return true;
+
             foreach (var p in System.Diagnostics.Process.GetProcesses())
             {
                 try
                 {
                     var n = p.ProcessName;
+                    if (n.Equals("MouseWithoutBorders.original", StringComparison.OrdinalIgnoreCase))
+                        return true;
                     if (n.Contains("MouseWithoutBorders", StringComparison.OrdinalIgnoreCase)
                         || n.Contains("MousewithoutBorders", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string? path = null;
+                        try { path = p.MainModule?.FileName; } catch { /* ignore */ }
+                        if (IsMwbSwbLaunchStub(path))
+                            continue;
                         return true;
+                    }
                 }
                 catch { /* access denied on some system procs */ }
                 finally { try { p.Dispose(); } catch { /* ignore */ } }
             }
+        }
+        catch { /* ignore */ }
+        return false;
+    }
+
+    /// <summary>
+    /// True when <paramref name="exePath"/> is the tiny MWB+SWB wrap stub
+    /// (MouseWithoutBorders.exe beside MouseWithoutBorders.original.exe).
+    /// </summary>
+    public static bool IsMwbSwbLaunchStub(string? exePath)
+    {
+        if (string.IsNullOrWhiteSpace(exePath)) return false;
+        try
+        {
+            var full = Path.GetFullPath(exePath);
+            var name = Path.GetFileName(full);
+            if (!name.Equals("MouseWithoutBorders.exe", StringComparison.OrdinalIgnoreCase))
+                return false;
+            var dir = Path.GetDirectoryName(full);
+            if (string.IsNullOrEmpty(dir)) return false;
+            if (File.Exists(Path.Combine(dir, "MouseWithoutBorders.original.exe")))
+                return true;
+            if (File.Exists(Path.Combine(dir, "MWB-SWB-WRAPPED.txt")))
+                return true;
         }
         catch { /* ignore */ }
         return false;
@@ -74,11 +129,12 @@ public static class GarageMwbSettings
             if (key is null)
                 return new MwbSettings { LocalHostName = Environment.MachineName };
 
-            // Prefer plaintext shared-key.txt (Garage patched CreateRandomKey source).
-            // HKCU MyKey is often DPAPI ciphertext — unusable for SWB HMAC while MWB still works.
-            var keyStr = TryReadSharedKeyFile()
-                         ?? PreferPlaintextKey(key.GetValue("SecurityKey") as string)
+            // SWB is an attachment: always follow Garage MWB's real key first.
+            // Do NOT prefer lab shared-key.txt over MyKey — that desyncs SWB from MWB mesh.
+            var keyStr = PreferPlaintextKey(key.GetValue("SecurityKey") as string)
+                         ?? TryUnprotectGarageMyKey(key.GetValue("MyKey") as string)
                          ?? PreferPlaintextKey(key.GetValue("MyKey") as string)
+                         ?? TryReadSharedKeyFile()
                          ?? "";
             var matrixRaw = (key.GetValue("MachineMatrix") as string)
                             ?? (key.GetValue("Machines") as string)
@@ -105,7 +161,7 @@ public static class GarageMwbSettings
         }
     }
 
-    /// <summary>Plaintext key file written by lab mesh / patched CreateRandomKey.</summary>
+    /// <summary>Lab-only fallback. Never preferred over Garage MyKey / SecurityKey.</summary>
     public static string? TryReadSharedKeyFile()
     {
         foreach (var path in new[]
@@ -121,6 +177,45 @@ public static class GarageMwbSettings
                 if (s.Length >= 16) return s;
             }
             catch { /* ignore */ }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Garage stores MyKey as DPAPI (CurrentUser) with fixed entropy GUID
+    /// (same as Setting.Enc in Garage / PowerToys MWB).
+    /// </summary>
+    public static string? TryUnprotectGarageMyKey(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        var s = raw.Trim().Replace("\r", "", StringComparison.Ordinal).Replace("\n", "", StringComparison.Ordinal);
+        if (s.Length < 16) return null;
+        try
+        {
+            // Must match Garage Setting.Enc entropy: "C39952A0-C11C-4fdd-9ADE-DEBC92E074D9" as Unicode bytes.
+            var entropy = Encoding.Unicode.GetBytes("C39952A0-C11C-4fdd-9ADE-DEBC92E074D9");
+            var bytes = Convert.FromBase64String(s);
+            foreach (var scope in new[] { DataProtectionScope.CurrentUser, DataProtectionScope.LocalMachine })
+            {
+                try
+                {
+                    var plain = ProtectedData.Unprotect(bytes, entropy, scope);
+                    // Garage GetStringU = Unicode
+                    var candidate = PreferPlaintextKey(Encoding.Unicode.GetString(plain));
+                    if (candidate != null) return candidate;
+                    candidate = PreferPlaintextKey(Encoding.UTF8.GetString(plain));
+                    if (candidate != null) return candidate;
+                }
+                catch
+                {
+                    /* try next scope */
+                }
+            }
+        }
+        catch
+        {
+            /* wrong format / corrupted */
         }
 
         return null;

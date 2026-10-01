@@ -34,7 +34,7 @@ B轨（可选覆盖安装）：
 
 - 托盘常驻；默认隐藏主状态窗。
 - 检测 Garage 进程：出现 → 可自动开 SWB（可关窗）；消失 → 关 SWB 并退出 Host。
-- 命令行 `/open-swb`：打开 SWB 并确保 Synchro 开启（供 Garage「Launch SWB」按钮与二次实例信令）。
+- 命令行 `/open-swb`：打开 SWB 窗；Synchro **继承**上次 `Enabled`（开机/MWB 附着同理）。安装后前 20s 忽略 exit pulse；MWB 短暂断档有启动 hold（120s）与加长 grace，避免装完即退。
 - 自包含 publish（无本机 .NET 8 的 VM 用）。
 
 ## 模块

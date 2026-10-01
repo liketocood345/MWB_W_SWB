@@ -46,8 +46,10 @@ public sealed class EchoCanceller
         if (refE > 1e-8)
         {
             var ratio = (float)Math.Sqrt(capE / refE);
-            var target = Math.Clamp(ratio, 0.15f, 1.2f);
-            _gain = _gain * 0.9f + target * 0.1f;
+            // Prefer stronger subtraction when capture looks like playback echo.
+            var target = Math.Clamp(ratio, 0.35f, 1.35f);
+            _gain = _gain * 0.85f + target * 0.15f;
+            if (_gain < 0.55f) _gain = 0.55f;
         }
 
         float peak = 0;
@@ -64,9 +66,9 @@ public sealed class EchoCanceller
     }
 
     /// <summary>True when residual is mostly echo of remote playback.</summary>
-    public static bool ShouldSuppressSend(float residualPeak, float rxHold, float capturePeakBefore, float threshold = 0.035f) =>
-        rxHold > 0.05f
-        && capturePeakBefore > 0.04f
+    public static bool ShouldSuppressSend(float residualPeak, float rxHold, float capturePeakBefore, float threshold = 0.05f) =>
+        rxHold > 0.04f
+        && capturePeakBefore > 0.03f
         && residualPeak < threshold
-        && residualPeak < capturePeakBefore * 0.35f;
+        && residualPeak < capturePeakBefore * 0.45f;
 }

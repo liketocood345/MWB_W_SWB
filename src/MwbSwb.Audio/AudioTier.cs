@@ -48,8 +48,9 @@ public static class AudioTier
         new(2, 12, 32, 42, 24, 32, 0.35, false, false, false),
         new(3, 10, 25, 35, 20, 30, 0.0, false, false, false),
         new(4, 8, 18, 26, 14, 20, 0.0, false, false, false),
-        new(5, 6, 12, 18, 10, 14, 0.0, true, false, false),
-        new(6, 4, 6, 10, 5, 8, 0.0, false, true, false),
+        // t5/t6: larger jitter + shared-friendly play latency; LightPlc only (FullPlc loop = 电音).
+        new(5, 6, 18, 28, 12, 18, 0.0, true, false, false),
+        new(6, 5, 14, 22, 10, 14, 0.0, true, false, false),
     };
 
     public static int Clamp(int tier) => Math.Clamp(tier, Min, Max);

@@ -43,6 +43,7 @@ public sealed class SwbHandshakeService : IAsyncDisposable
     public const int ProtocolVersion = 1;
     public const string IntentNameProbe = "name-probe";
     public const string IntentFull = "full";
+    public const string IntentSettingsSync = "settings-sync";
     private static readonly byte[] Magic = Encoding.ASCII.GetBytes("SWB1");
 
     private readonly MwbSettings _mwb;
@@ -79,10 +80,15 @@ public sealed class SwbHandshakeService : IAsyncDisposable
     public double LocalElevationDeg { get; set; }
     public double LocalRadius { get; set; } = 1.0;
 
+    /// <summary>Local mesh settings advertised on hello / accept / settings-sync.</summary>
+    public SwbMeshSettings LocalMeshSettings { get; set; } = new(0, 3, 0, true, true, true, false, 30);
+
     public event Action<string>? Log;
     public event Action<SwbPeerInfo>? PeerConfirmed;
     /// <summary>Fired when a same-key peer discloses its hostname via name-probe reject (or UDP beacon).</summary>
     public event Action<SwbPeerInfo>? PeerNamed; // hostname disclosed (+ advertised pose)
+    /// <summary>Fired when a peer advertises mesh settings (full hello or settings-sync).</summary>
+    public event Action<SwbMeshSettings, string>? MeshSettingsReceived;
 
     public SwbHandshakeService(
         MwbSettings mwb,
@@ -222,20 +228,7 @@ public sealed class SwbHandshakeService : IAsyncDisposable
 
             var nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
             var token = ComputeToken(_mwb.SecurityKey, nonce, _mwb.LocalHostName, "client");
-            await WriteFrameAsync(stream, new
-            {
-                host = _mwb.LocalHostName,
-                nonce,
-                token,
-                intent = IntentNameProbe,
-                role = (int)LocalRole,
-                sampleRate = SampleRate,
-                channels = Channels,
-                protocol = ProtocolVersion,
-                azimuth = LocalAzimuthDeg,
-                elevation = LocalElevationDeg,
-                radius = LocalRadius,
-            }, timeout.Token).ConfigureAwait(false);
+            await WriteFrameAsync(stream, BuildClientHello(nonce, token, IntentNameProbe), timeout.Token).ConfigureAwait(false);
 
             var reply = await ReadFrameAsync(stream, timeout.Token).ConfigureAwait(false);
             if (reply is null)
@@ -333,45 +326,29 @@ public sealed class SwbHandshakeService : IAsyncDisposable
                 // Same key → actively reject name-probe and disclose local device/host name.
                 if (string.Equals(intent, IntentNameProbe, StringComparison.OrdinalIgnoreCase))
                 {
-                    await WriteFrameAsync(stream, new
-                    {
-                        ok = false,
-                        error = IntentNameProbe,
-                        host = _mwb.LocalHostName,
-                        controlPort = ControlPort,
-                        audioPort = AudioPort,
-                        protocol = ProtocolVersion,
-                azimuth = LocalAzimuthDeg,
-                elevation = LocalElevationDeg,
-                radius = LocalRadius,
-                    }, ct).ConfigureAwait(false);
+                    await WriteFrameAsync(stream, BuildServerRejectNameProbe(), ct).ConfigureAwait(false);
                     if (!string.IsNullOrWhiteSpace(ip))
                         _endpointHints[ip] = remoteHost;
                     LogRare($"np-rej:{remoteHost}", $"Name-probe reject -> disclosed host={_mwb.LocalHostName} to {remoteHost}");
                     return;
                 }
 
+                // Settings-only: exchange mesh UI settings, no audio mesh confirm.
+                if (string.Equals(intent, IntentSettingsSync, StringComparison.OrdinalIgnoreCase))
+                {
+                    EmitMeshSettingsIfPresent(hello, remoteHost);
+                    var sn = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
+                    var st = ComputeToken(_mwb.SecurityKey, sn, _mwb.LocalHostName, "server");
+                    await WriteFrameAsync(stream, BuildServerAccept(sn, st), ct).ConfigureAwait(false);
+                    return;
+                }
+
                 var serverNonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
                 var serverToken = ComputeToken(_mwb.SecurityKey, serverNonce, _mwb.LocalHostName, "server");
-                await WriteFrameAsync(stream, new
-                {
-                    ok = true,
-                    host = _mwb.LocalHostName,
-                    nonce = serverNonce,
-                    token = serverToken,
-                    controlPort = ControlPort,
-                    audioPort = AudioPort,
-                    role = (int)LocalRole,
-                    sampleRate = SampleRate,
-                    channels = Channels,
-                    stereoOk = Channels >= 2,
-                    protocol = ProtocolVersion,
-                azimuth = LocalAzimuthDeg,
-                elevation = LocalElevationDeg,
-                radius = LocalRadius,
-                }, ct).ConfigureAwait(false);
+                await WriteFrameAsync(stream, BuildServerAccept(serverNonce, serverToken), ct).ConfigureAwait(false);
 
                 var (raz, rel, rrad) = ReadPose(hello);
+                EmitMeshSettingsIfPresent(hello, remoteHost);
                 var inbound = new SwbPeerInfo(
                     remoteHost, ip, ControlPort, AudioPort, SwbPeerRole.Both, SampleRate, Channels, Channels >= 2, raz, rel, rrad);
                 MarkMeshConfirmed(inbound);
@@ -395,20 +372,7 @@ public sealed class SwbHandshakeService : IAsyncDisposable
 
         var nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
         var token = ComputeToken(_mwb.SecurityKey, nonce, _mwb.LocalHostName, "client");
-        await WriteFrameAsync(stream, new
-        {
-            host = _mwb.LocalHostName,
-            nonce,
-            token,
-            intent,
-            role = (int)LocalRole,
-            sampleRate = SampleRate,
-            channels = Channels,
-            protocol = ProtocolVersion,
-                azimuth = LocalAzimuthDeg,
-                elevation = LocalElevationDeg,
-                radius = LocalRadius,
-        }, timeout.Token).ConfigureAwait(false);
+        await WriteFrameAsync(stream, BuildClientHello(nonce, token, intent), timeout.Token).ConfigureAwait(false);
 
         var reply = await ReadFrameAsync(stream, timeout.Token).ConfigureAwait(false);
         if (reply is null || !reply.Value.GetProperty("ok").GetBoolean())
@@ -433,7 +397,143 @@ public sealed class SwbHandshakeService : IAsyncDisposable
         var ip = NormalizeIpString((client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? host);
 
         var (caz, cel, crad) = ReadPose(reply);
+        EmitMeshSettingsIfPresent(reply, remoteHost);
         return new SwbPeerInfo(remoteHost, ip, ControlPort, audioPort, SwbPeerRole.Both, sampleRate, channels, stereoOk, caz, cel, crad);
+    }
+
+    /// <summary>Push current LocalMeshSettings to every mesh-confirmed IP (last-writer epoch on each peer).</summary>
+    public async Task PushSettingsToMeshAsync(CancellationToken ct = default)
+    {
+        var targets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kv in _endpointHints.ToArray())
+        {
+            var ip = NormalizeIpString(kv.Key);
+            if (!IPAddress.TryParse(ip, out var addr) || addr.AddressFamily != AddressFamily.InterNetwork)
+                continue;
+            if (!_meshConfirmed.ContainsKey(ip) && !_meshConfirmed.ContainsKey(kv.Value))
+                continue;
+            targets.Add(ip);
+        }
+
+        foreach (var ip in targets)
+        {
+            if (ct.IsCancellationRequested) break;
+            try
+            {
+                await HandshakeAsClientAsync(ip, IntentSettingsSync, ct).ConfigureAwait(false);
+                LogRare($"set-push:{ip}", $"Settings-sync pushed -> {ip} epoch={LocalMeshSettings.Epoch}");
+            }
+            catch (Exception ex)
+            {
+                LogRare($"set-push-fail:{ip}", $"Settings-sync fail -> {ip}: {ex.Message}");
+            }
+        }
+    }
+
+    private object BuildClientHello(string nonce, string token, string intent)
+    {
+        var ms = LocalMeshSettings;
+        return new
+        {
+            host = _mwb.LocalHostName,
+            nonce,
+            token,
+            intent,
+            role = (int)LocalRole,
+            sampleRate = SampleRate,
+            channels = Channels,
+            protocol = ProtocolVersion,
+            azimuth = LocalAzimuthDeg,
+            elevation = LocalElevationDeg,
+            radius = LocalRadius,
+            settingsEpoch = ms.Epoch,
+            audioTier = ms.AudioTier,
+            spatialMode = ms.SpatialMode,
+            distanceAttenuation = ms.DistanceAttenuation,
+            sendLocalLoopback = ms.SendLocalLoopback,
+            receiveAndMix = ms.ReceiveAndMix,
+            synchroEnabled = ms.Enabled,
+            targetSyncToleranceMs = ms.TargetSyncToleranceMs,
+        };
+    }
+
+    private object BuildServerRejectNameProbe()
+    {
+        var ms = LocalMeshSettings;
+        return new
+        {
+            ok = false,
+            error = IntentNameProbe,
+            host = _mwb.LocalHostName,
+            controlPort = ControlPort,
+            audioPort = AudioPort,
+            protocol = ProtocolVersion,
+            azimuth = LocalAzimuthDeg,
+            elevation = LocalElevationDeg,
+            radius = LocalRadius,
+            settingsEpoch = ms.Epoch,
+            audioTier = ms.AudioTier,
+            spatialMode = ms.SpatialMode,
+            distanceAttenuation = ms.DistanceAttenuation,
+            sendLocalLoopback = ms.SendLocalLoopback,
+            receiveAndMix = ms.ReceiveAndMix,
+            synchroEnabled = ms.Enabled,
+            targetSyncToleranceMs = ms.TargetSyncToleranceMs,
+        };
+    }
+
+    private object BuildServerAccept(string serverNonce, string serverToken)
+    {
+        var ms = LocalMeshSettings;
+        return new
+        {
+            ok = true,
+            host = _mwb.LocalHostName,
+            nonce = serverNonce,
+            token = serverToken,
+            controlPort = ControlPort,
+            audioPort = AudioPort,
+            role = (int)LocalRole,
+            sampleRate = SampleRate,
+            channels = Channels,
+            stereoOk = Channels >= 2,
+            protocol = ProtocolVersion,
+            azimuth = LocalAzimuthDeg,
+            elevation = LocalElevationDeg,
+            radius = LocalRadius,
+            settingsEpoch = ms.Epoch,
+            audioTier = ms.AudioTier,
+            spatialMode = ms.SpatialMode,
+            distanceAttenuation = ms.DistanceAttenuation,
+            sendLocalLoopback = ms.SendLocalLoopback,
+            receiveAndMix = ms.ReceiveAndMix,
+            synchroEnabled = ms.Enabled,
+            targetSyncToleranceMs = ms.TargetSyncToleranceMs,
+        };
+    }
+
+    private void EmitMeshSettingsIfPresent(JsonElement? el, string fromHost)
+    {
+        var ms = ReadMeshSettings(el);
+        if (ms is null) return;
+        try { MeshSettingsReceived?.Invoke(ms, fromHost); }
+        catch (Exception ex) { Log?.Invoke($"MeshSettings handler: {ex.Message}"); }
+    }
+
+    private static SwbMeshSettings? ReadMeshSettings(JsonElement? el)
+    {
+        if (el is null) return null;
+        var v = el.Value;
+        if (!v.TryGetProperty("settingsEpoch", out var epEl) || !epEl.TryGetInt64(out var epoch))
+            return null;
+        var tier = v.TryGetProperty("audioTier", out var t) && t.TryGetInt32(out var ti) ? ti : 3;
+        var spatial = v.TryGetProperty("spatialMode", out var s) && s.TryGetInt32(out var si) ? si : 0;
+        var atten = !v.TryGetProperty("distanceAttenuation", out var a) || a.ValueKind != JsonValueKind.False;
+        var send = !v.TryGetProperty("sendLocalLoopback", out var se) || se.ValueKind != JsonValueKind.False;
+        var recv = !v.TryGetProperty("receiveAndMix", out var re) || re.ValueKind != JsonValueKind.False;
+        var enabled = v.TryGetProperty("synchroEnabled", out var en) && en.ValueKind == JsonValueKind.True;
+        var tol = v.TryGetProperty("targetSyncToleranceMs", out var to) && to.TryGetInt32(out var toi) ? toi : 30;
+        return new SwbMeshSettings(epoch, tier, spatial, atten, send, recv, enabled, tol);
     }
 
     private async Task DiscoveryListenAsync(CancellationToken ct)

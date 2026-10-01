@@ -48,6 +48,8 @@ public sealed class SwbForm : Form
     private readonly HashSet<string> _liveSameKeyPeers = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _synchroGate = new(1, 1);
     private int _synchroBusy;
+    private int _applyingRemoteSettings;
+    private int _meshPushQueued;
     private bool _portConflict;
 
     public SwbForm()
@@ -143,7 +145,7 @@ public sealed class SwbForm : Form
         return true;
     }
 
-    /// <summary>Turn on Sound Synchro (starts LAN handshake). Used by Host /open-swb.</summary>
+    /// <summary>Turn on Sound Synchro (starts LAN handshake). Used when user explicitly wants synchro on.</summary>
     public void EnsureSoundSynchroEnabled()
     {
         if (IsDisposed) return;
@@ -171,6 +173,46 @@ public sealed class SwbForm : Form
             _chkSoundSynchro.Checked = true;
         else
             _ = OnSoundSynchroChangedAsync();
+    }
+
+    /// <summary>
+    /// Boot / MWB-attach: start mesh only if last session left Sound Synchro Enabled=true.
+    /// Does not force-on when user previously turned it off.
+    /// </summary>
+    public void ApplyPersistedSynchroState()
+    {
+        if (IsDisposed) return;
+        if (InvokeRequired)
+        {
+            BeginInvoke(ApplyPersistedSynchroState);
+            return;
+        }
+
+        try
+        {
+            File.AppendAllText(@"C:\Users\Public\swb-enable.log",
+                $"[{DateTime.Now:HH:mm:ss}] ApplyPersistedSynchroState enabled={_synchro.Enabled} checked={_chkSoundSynchro.Checked} hs={_handshake != null}{Environment.NewLine}");
+        }
+        catch { /* ignore */ }
+
+        RefreshMwbStatus();
+        if (_portConflict)
+            return;
+
+        if (!_synchro.Enabled)
+        {
+            // Keep checkbox off; do not start handshake.
+            if (_chkSoundSynchro.Checked)
+            {
+                Interlocked.Exchange(ref _applyingRemoteSettings, 1);
+                try { _chkSoundSynchro.Checked = false; }
+                finally { Interlocked.Exchange(ref _applyingRemoteSettings, 0); }
+            }
+            return;
+        }
+
+        // Persisted on — enable mesh (same as Ensure when already intended on).
+        EnsureSoundSynchroEnabled();
     }
 
     private void BuildUi()
@@ -251,8 +293,10 @@ public sealed class SwbForm : Form
         _chkSend.Location = new Point(560, 28);
         _chkSend.CheckedChanged += (_, _) =>
         {
+            if (_applyingRemoteSettings != 0) return;
             _synchro.SendLocalLoopback = _chkSend.Checked;
             _synchro.Save();
+            PushMeshSettingsSoon();
         };
 
         _chkRecv.Text = "Receive & mix";
@@ -261,8 +305,10 @@ public sealed class SwbForm : Form
         _chkRecv.Location = new Point(560, 52);
         _chkRecv.CheckedChanged += (_, _) =>
         {
+            if (_applyingRemoteSettings != 0) return;
             _synchro.ReceiveAndMix = _chkRecv.Checked;
             _synchro.Save();
+            PushMeshSettingsSoon();
         };
 
         _chkAttenuate.Text = "Distance attenuation";
@@ -270,9 +316,11 @@ public sealed class SwbForm : Form
         _chkAttenuate.Location = new Point(310, 252);
         _chkAttenuate.CheckedChanged += (_, _) =>
         {
+            if (_applyingRemoteSettings != 0) return;
             _synchro.DistanceAttenuation = _chkAttenuate.Checked;
             _synchro.Save();
             _audio?.ApplySpatial(_synchro);
+            PushMeshSettingsSoon();
         };
 
         _rbSync.Text = "Sync only";
@@ -280,12 +328,13 @@ public sealed class SwbForm : Form
         _rbSync.Location = new Point(480, 252);
         _rbSync.CheckedChanged += (_, _) =>
         {
-            if (!_rbSync.Checked) return;
+            if (!_rbSync.Checked || _applyingRemoteSettings != 0) return;
             _synchro.SpatialMode = SpatialLayoutMode.SyncOnly;
             _synchro.Save();
             _spatial.Bind(_synchro);
             _audio?.ApplySpatial(_synchro);
             PushLocalPoseToHandshake();
+            PushMeshSettingsSoon();
         };
 
         _rb2d.Text = "2D ring";
@@ -293,12 +342,13 @@ public sealed class SwbForm : Form
         _rb2d.Location = new Point(570, 252);
         _rb2d.CheckedChanged += (_, _) =>
         {
-            if (!_rb2d.Checked) return;
+            if (!_rb2d.Checked || _applyingRemoteSettings != 0) return;
             _synchro.SpatialMode = SpatialLayoutMode.Ring2D;
             _synchro.Save();
             _spatial.Bind(_synchro);
             _audio?.ApplySpatial(_synchro);
             PushLocalPoseToHandshake();
+            PushMeshSettingsSoon();
         };
 
         _rb3d.Text = "3D sphere";
@@ -306,12 +356,13 @@ public sealed class SwbForm : Form
         _rb3d.Location = new Point(650, 252);
         _rb3d.CheckedChanged += (_, _) =>
         {
-            if (!_rb3d.Checked) return;
+            if (!_rb3d.Checked || _applyingRemoteSettings != 0) return;
             _synchro.SpatialMode = SpatialLayoutMode.Sphere3D;
             _synchro.Save();
             _spatial.Bind(_synchro);
             _audio?.ApplySpatial(_synchro);
             PushLocalPoseToHandshake();
+            PushMeshSettingsSoon();
         };
 
         _btnHandshake.Text = "Re-probe peers";
@@ -377,7 +428,7 @@ public sealed class SwbForm : Form
         _spatial.Height = 220;
         _spatial.LayoutChanged += () =>
         {
-            _synchro.Save();
+            _synchro.Save(bumpEpoch: false);
             _audio?.ApplySpatial(_synchro);
             PushLocalPoseToHandshake();
         };
@@ -444,7 +495,7 @@ public sealed class SwbForm : Form
         if (_playbackCombo.SelectedIndex < 0 || _playbackCombo.SelectedIndex >= _playbackItems.Count) return;
         var id = _playbackItems[_playbackCombo.SelectedIndex].Id;
         _synchro.LocalPlaybackDeviceId = id;
-        _synchro.Save();
+        _synchro.Save(bumpEpoch: false);
         _audio?.SetPlaybackDeviceId(id);
     }
 
@@ -461,6 +512,7 @@ public sealed class SwbForm : Form
 
     private void ApplyTierFromUi(int tier, bool fromSlider)
     {
+        if (_applyingRemoteSettings != 0) return;
         tier = Math.Clamp(tier, 0, 6);
         _synchro.AudioTier = tier;
         _synchro.Save();
@@ -472,6 +524,7 @@ public sealed class SwbForm : Form
         _tierLabel.Text = "Latency slider (drag 0..6)  /  " + AudioTier.EnglishName(tier);
         _audio?.SetAudioTier(tier);
         _audio?.ApplySpatial(_synchro);
+        PushMeshSettingsSoon();
         if (tier <= 2)
             _ = ProbeAndRefreshAsync();
     }
@@ -522,6 +575,8 @@ public sealed class SwbForm : Form
 
     private async Task OnSoundSynchroChangedAsync()
     {
+        if (_applyingRemoteSettings != 0)
+            return;
         if (Interlocked.CompareExchange(ref _synchroBusy, 1, 0) != 0)
             return;
 
@@ -530,6 +585,7 @@ public sealed class SwbForm : Form
         {
             _synchro.Enabled = _chkSoundSynchro.Checked;
             _synchro.Save();
+            PushMeshSettingsSoon();
             if (_chkSoundSynchro.Checked)
                 await EnableSoundSynchroAsync();
             else
@@ -592,9 +648,14 @@ public sealed class SwbForm : Form
                 LocalRole = SwbPeerRole.Both,
                 SampleRate = 48000,
                 Channels = 2,
+                LocalMeshSettings = _synchro.ToMeshSettings(),
             };
             PushLocalPoseToHandshake();
             _handshake.Log += AppendLog;
+            _handshake.MeshSettingsReceived += (ms, fromHost) =>
+            {
+                BeginInvoke(() => ApplyRemoteMeshSettings(ms, fromHost));
+            };
             _handshake.PeerNamed += named =>
             {
                 BeginInvoke(() =>
@@ -613,7 +674,7 @@ public sealed class SwbForm : Form
                     _synchro.UpsertAdvertisedPose(host, named.AzimuthDeg, named.ElevationDeg, named.Radius);
                     _spatial.Bind(_synchro);
                     _audio?.ApplySpatial(_synchro);
-                    _synchro.Save();
+                    _synchro.Save(bumpEpoch: false);
 
                     TryFillMwbMatrixOnce(host);
                     UpdateGrayOverlay();
@@ -632,10 +693,11 @@ public sealed class SwbForm : Form
                     _synchro.UpsertAdvertisedPose(peer.HostName, peer.AzimuthDeg, peer.ElevationDeg, peer.Radius);
                     _spatial.Bind(_synchro);
                     _audio?.ApplySpatial(_synchro);
-                    _synchro.Save();
+                    _synchro.Save(bumpEpoch: false);
                     UpsertMatrixRow(peer);
                     TryFillMwbMatrixOnce(peer.HostName);
                     UpdateGrayOverlay();
+                    PushMeshSettingsSoon();
                     try
                     {
                         File.AppendAllText(@"C:\Users\Public\swb-enable.log",
@@ -813,6 +875,53 @@ public sealed class SwbForm : Form
         _handshake.LocalAzimuthDeg = pose.AzimuthDeg;
         _handshake.LocalElevationDeg = pose.ElevationDeg;
         _handshake.LocalRadius = pose.Radius;
+        _handshake.LocalMeshSettings = _synchro.ToMeshSettings();
+    }
+
+    private void PushMeshSettingsSoon()
+    {
+        if (_handshake == null) return;
+        _handshake.LocalMeshSettings = _synchro.ToMeshSettings();
+        if (Interlocked.Exchange(ref _meshPushQueued, 1) != 0)
+            return;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(250).ConfigureAwait(false);
+                Interlocked.Exchange(ref _meshPushQueued, 0);
+                var hs = _handshake;
+                if (hs == null) return;
+                hs.LocalMeshSettings = _synchro.ToMeshSettings();
+                await hs.PushSettingsToMeshAsync().ConfigureAwait(false);
+            }
+            catch
+            {
+                Interlocked.Exchange(ref _meshPushQueued, 0);
+            }
+        });
+    }
+
+    private void ApplyRemoteMeshSettings(SwbMeshSettings remote, string fromHost)
+    {
+        if (!_synchro.TryApplyMeshSettings(remote))
+            return;
+
+        Interlocked.Exchange(ref _applyingRemoteSettings, 1);
+        try
+        {
+            ApplySynchroToUi();
+            _audio?.SetAudioTier(_synchro.AudioTier);
+            _audio?.SetSendRecv(_synchro.SendLocalLoopback, _synchro.ReceiveAndMix);
+            _audio?.ApplySpatial(_synchro);
+            if (_handshake != null)
+                _handshake.LocalMeshSettings = _synchro.ToMeshSettings();
+            AppendLog($"Mesh settings from {fromHost}: tier={_synchro.AudioTier} spatial={_synchro.SpatialMode} epoch={remote.Epoch}");
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _applyingRemoteSettings, 0);
+        }
     }
 
     private static bool IsLocalMatrixItem(ListViewItem item) =>

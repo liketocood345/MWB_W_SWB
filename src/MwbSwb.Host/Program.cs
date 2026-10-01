@@ -2,9 +2,9 @@ namespace MwbSwb.Host;
 
 static class Program
 {
-    private const string MutexName = "Global\\MwbSwb.Host.Singleton";
-    private const string OpenSwbEventName = "Global\\MwbSwb.Host.OpenSwb";
-    private const string ExitEventName = "Global\\MwbSwb.Host.ExitGraceful";
+    private const string MutexName = "Local\\MwbSwb.Host.Singleton";
+    private const string OpenSwbEventName = "Local\\MwbSwb.Host.OpenSwb";
+    private const string ExitEventName = "Local\\MwbSwb.Host.ExitGraceful";
     private const string PulsePath = @"C:\Users\Public\MWB-SWB-Host\open-swb.pulse";
     private const string ExitPulsePath = @"C:\Users\Public\MWB-SWB-Host\exit-host.pulse";
 
@@ -114,9 +114,18 @@ static class Program
         // Soft-restart / multi-root: ask prior Host to hide tray + exit before we create ours.
         // Hard Kill leaves NotifyIcon ghosts (flood of dead tray glyphs until mouse-over).
         RequestGracefulExitOfStrayHosts();
+        // Discard exit signals WE just used to clear strays — otherwise this new Host
+        // consumes its own exit-host.pulse / leftover ExitGraceful Set and quits instantly.
+        DiscardStaleExitSignals();
 
         using var openSwbEvent = new EventWaitHandle(false, EventResetMode.AutoReset, OpenSwbEventName);
         using var exitEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ExitEventName);
+        DrainNamedAutoReset(exitEvent);
+        // Concurrent install launches write exit pulses for "strays" that are actually siblings
+        // started in the same second — ignore exit until settle, keep draining so we don't later
+        // consume a sibling's leftover pulse.
+        var exitArmedAt = Environment.TickCount64 + 20_000;
+        BootLog("exit-poll armed after 20s settle (ignore stray exit pulses until then)");
 
         ApplicationConfiguration.Initialize();
         HostForm form;
@@ -135,11 +144,24 @@ static class Program
         var poll = new System.Windows.Forms.Timer { Interval = 400 };
         poll.Tick += (_, _) =>
         {
-            if (exitEvent.WaitOne(0) || TryConsumeExitPulse())
+            var exitEventHit = exitEvent.WaitOne(0);
+            var pulsePresent = ExitPulseExists();
+            if (exitEventHit || pulsePresent)
             {
-                BootLog("graceful-exit requested");
-                form.RequestGracefulExit();
-                return;
+                if (Environment.TickCount64 < exitArmedAt)
+                {
+                    DiscardStaleExitSignals();
+                    DrainNamedAutoReset(exitEvent);
+                    BootLog("ignored early exit signal (startup settle)");
+                }
+                else
+                {
+                    if (pulsePresent)
+                        TryConsumeExitPulse();
+                    BootLog("graceful-exit requested");
+                    form.RequestGracefulExit();
+                    return;
+                }
             }
 
             var viaEvent = openSwbEvent.WaitOne(0);
@@ -166,6 +188,16 @@ static class Program
         poll.Stop();
         poll.Dispose();
         BootLog("Application.Run exited");
+    }
+
+    static bool ExitPulseExists()
+    {
+        foreach (var path in new[] { ExitPulsePath, LocalExitPulsePath })
+        {
+            try { if (File.Exists(path)) return true; }
+            catch { /* ignore */ }
+        }
+        return false;
     }
 
     static bool TryConsumeExitPulse()
@@ -261,8 +293,48 @@ static class Program
             TrayNotifyCleanup.RefreshNotificationArea();
             Thread.Sleep(200);
             TrayNotifyCleanup.RefreshNotificationArea();
+
+            // Strays are gone — clear pulses/event so the survivor does not self-exit.
+            DiscardStaleExitSignals();
         }
         catch (Exception ex) { BootLog("scan Host: " + ex.Message); }
+    }
+
+    /// <summary>Delete leftover exit pulses and drain a signaled ExitGraceful named event.</summary>
+    static void DiscardStaleExitSignals()
+    {
+        foreach (var path in new[] { ExitPulsePath, LocalExitPulsePath })
+        {
+            try
+            {
+                if (!File.Exists(path)) continue;
+                File.Delete(path);
+                BootLog("discarded stale exit pulse: " + path);
+            }
+            catch (Exception ex)
+            {
+                BootLog("discard exit pulse failed " + path + ": " + ex.Message);
+            }
+        }
+
+        try
+        {
+            using var ev = EventWaitHandle.OpenExisting(ExitEventName);
+            var n = 0;
+            while (ev.WaitOne(0) && n++ < 8) { }
+            if (n > 0) BootLog("drained ExitGraceful leftover signals=" + n);
+        }
+        catch
+        {
+            // Event may not exist yet — fine.
+        }
+    }
+
+    static void DrainNamedAutoReset(EventWaitHandle ev)
+    {
+        var n = 0;
+        while (ev.WaitOne(0) && n++ < 8) { }
+        if (n > 0) BootLog("drained exitEvent at create leftover=" + n);
     }
 
     /// <summary>

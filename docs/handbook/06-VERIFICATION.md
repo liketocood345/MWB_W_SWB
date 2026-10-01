@@ -25,7 +25,7 @@
 | A4 | Stereo matrix dual-VM | **PARTIAL** | 需人工听感；链路 ESTABLISHED 已测 |
 | A8 | 7-tier latency slider | **PASS** | TrackBar 0–6；默认 Balanced |
 | A9 | AEC send dedup (fallback) | **PASS** | endpoint-fallback 时参考消回声 |
-| A14 | Process loopback EXCLUDE self | **PASS** | 双 VM Server 2022：`loopback=exclude-self` + `MESH_OK`；native `SwbProcessLoopback.dll`；代播 TX 门控仍生效（exclude 时跳过 AEC） |
+| A14 | Process loopback EXCLUDE self | **PASS** | Win10 ≥19041 / Server 2022：`loopback=exclude-self`；native `SwbProcessLoopback.dll`；激活失败才 endpoint+AEC |
 | A10 | 12B frame + stale ts | **PASS** | PCM16；秒级过时丢弃 |
 | A11 | Latency budget doc | **PASS** | 05b 与实现同步维护 |
 | A12 | Mesh retry + no beacon spam | **PASS** | 未确认对端 12s 重试；beacon 只记首见 |

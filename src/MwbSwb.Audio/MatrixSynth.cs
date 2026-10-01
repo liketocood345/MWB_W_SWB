@@ -72,7 +72,7 @@ public sealed class MatrixSynth : ISampleProvider
             ring.SetPlc(_plc);
             ring.SetHoldSilentUntilPrimed(holdSilent || !_plc);
         }
-        _reference.SetDelayFrames(Math.Max(1, p.PlayLatencyMs * sampleRate / 1000));
+        _reference.SetDelayFrames(Math.Max(Math.Max(p.PlayLatencyMs, 50) * sampleRate / 1000, 1));
         _barrierStartQpc = 0;
         _barrierReleased = false;
         Interlocked.Exchange(ref _firstAudibleFired, 0);

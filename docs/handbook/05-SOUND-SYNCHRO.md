@@ -8,7 +8,7 @@
 4. 可选：本机 WASAPI loopback → 对端；对端流 → 本机 **MatrixSynth 单总线** 混音后输出。
 5. **本机发声设备**即使尚无对端，也必须出现在矩阵/列表（至少显示本机扬声器）。
 
-传输：UDP **15201**（控制 TCP **15200**），与 MWB **15100/15101** 分离。
+传输：UDP **15201**（控制 TCP **15200**），与 MWB **15100/15101** 分离。音频发送走后台队列 + 非阻塞 UDP（队列满则丢 SWB 包），DSCP CS1 后台优先级，避免挤占 MWB 键鼠。
 
 音频帧：固定 **12 字节头**（magic `SW` / tier / rate / plc / seq / **Unix 秒戳** / CRC16）+ **PCM16 立体声**。身份靠 UDP 源 IP。过时丢弃默认 age &gt; **30s**（兼容 VM 时钟偏斜；物理 LAN 可更严）。
 
@@ -24,7 +24,7 @@ UI：英文 TrackBar 0–6，左偏同步、右偏低延；默认 **3 Balanced**
 | 3 | Balanced | 平衡 | 10 ms | 否 | 否 |
 | 4 | Responsive | 迅响 | 8 ms | 否 | 否 |
 | 5 | Near realtime | 近实时 | 6 ms | 否 | 轻 PLC |
-| 6 | Ultra-low | 超低延时 | 4 ms | 否 | PLC / 可 24k |
+| 6 | Ultra-low | 超低延时 | 5 ms | 否 | 轻 PLC（禁 FullPlc 循环，防电音） |
 
 ### 本机播放设备（独立下拉 · Local playback）
 
@@ -45,7 +45,7 @@ UI：英文 TrackBar 0–6，左偏同步、右偏低延；默认 **3 Balanced**
 - **对端屏障**：`MatrixSync` 在 `SyncAlignStrength≥1` 时，所有已收到数据的 peer 均 primed 才混音出声（超时 1.5s 放弃，避免永久静音）。
 - **Δ**：`ForceSyncCalibrator` = `MaxRTT − RTT(peer)`；`|Δ| &lt; ToleranceMs` 则视为 0。探针失败 → 仅本地水位阻断，日志说明无 Δ。
 
-t5/t6 播放优先 **WASAPI Exclusive**（失败回退 Shared）。阶段耗时见 `C:\Users\Public\swb-latency-stages.log`（QPC：cap→rx→first audible）。
+t5/t6 播放优先 **WASAPI Exclusive**（**Sync only 强制 Shared**；失败回退 Shared）。PLC 为单次淡出，禁止把衰减样本写回 last-frame（旧实现会金属电音）。阶段耗时见 `C:\Users\Public\swb-latency-stages.log`（QPC：cap→rx→first audible）。
 
 全链路耗时权威表见 **[05b-LATENCY-BUDGET.md](05b-LATENCY-BUDGET.md)**（技术改动必须同步更新）。
 
@@ -53,8 +53,8 @@ t5/t6 播放优先 **WASAPI Exclusive**（失败回退 Shared）。阶段耗时�
 
 Send+Recv 同时开时，采集路径按优先级：
 
-1. **主路径（Win10 Build ≥20348 / Server 2022）**：进程内录 `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE`，`TargetProcessId` = Host PID。内录仍为其它进程系统声，但**不含**本进程 `WasapiOut` 混出的对端声，电气环路在源头断开。日志：`loopback=exclude-self`。此模式下跳过参考减/整帧去重（避免误伤本机游戏声）。
-2. **回退**：全量 endpoint `WasapiLoopbackCapture`；播放总线写入参考环；loopback 减去延迟参考；残差低则 **整帧不发送**。日志：`loopback=endpoint-fallback`。
+1. **主路径（Win10 Build ≥19041 / 2004+，含本机常见 19045）**：进程内录 `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE`，`TargetProcessId` = Host PID。内录仍为其它进程系统声，但**不含**本进程 `WasapiOut` 混出的对端声，电气环路在源头断开。日志：`loopback=exclude-self`。此模式下跳过参考减/整帧去重（避免误伤本机游戏声）。激活失败仍回退。
+2. **回退**：全量 endpoint `WasapiLoopbackCapture`；播放总线写入参考环（AEC 延迟下限约 **50ms**）；loopback 减去延迟参考；残差低则 **整帧不发送**。日志：`loopback=endpoint-fallback` / `AEC suppress send…`。
 
 托盘 TX 读**实际上行**电平（exclude 下为本机其它进程声；fallback 下去重后残差）。
 
@@ -68,7 +68,13 @@ Send+Recv 同时开时，采集路径按优先级：
 | **2D ring** | 环 + 环上设备点 | **拖动点**改变方位角 |
 | **3D sphere** | 球面点 + **参考法平面** | **拖空白**改观察视角；**选中点再拖**改方位/仰角 |
 
-布局写入 `%LOCALAPPDATA%\Microsoft\MWB-SWB\SoundSynchro.json`（含 `AudioTier` / pose / `SpatialMode`）。
+布局写入 `%LOCALAPPDATA%\Microsoft\MWB-SWB\SoundSynchro.json`（含 `AudioTier` / pose / `SpatialMode` / `SettingsEpoch`）。
+
+### 设备间设置同步（mesh）
+
+- 握手 hello / accept / `intent=settings-sync` 携带：`settingsEpoch`、`audioTier`、`spatialMode`、`distanceAttenuation`、`sendLocalLoopback`、`receiveAndMix`、`synchroEnabled`、`targetSyncToleranceMs`。
+- **Last-writer-wins**：对端 `SettingsEpoch` 更新时本地 `TryApplyMeshSettings` 并刷新 UI；本机改滑块/勾选后 `PushSettingsToMeshAsync`。
+- **不同步**：`LocalPlaybackDeviceId`、各机自报 pose（仍走 azimuth/elevation/radius）。
 
 ### 初始位置：各机自报，禁止连接后重排
 

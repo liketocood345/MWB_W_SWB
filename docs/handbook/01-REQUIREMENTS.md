@@ -5,7 +5,7 @@
 1. **MWB 完整性优先** — 键鼠/剪贴板/小文件、布局与热键必须可用；SWB 不得打断 MWB。
 2. **继承 SecurityKey / 机器表** — 不为 SWB 强迫用户重配对；不默认改写 SecurityKey。
 3. **混连** — 任意混合 {stock MWB, MWB+SWB / Garage+Host}；无 SWB 对端 → 纯 MWB。
-4. **SWB 叠加** — 仅双方有 SWB 且 Synchro 开启时传声；**禁止**占用/污染 MWB **15100/15101**。
+4. **SWB 叠加** — 仅双方有 SWB 且 Synchro 开启时传声；**禁止**占用/污染 MWB **15100/15101**。SWB 只借用 SecurityKey 做旁路握手；音频 TX 为尽力而为（排队/丢包/低 DSCP），**不得**阻塞键鼠点击传输。
 5. **立体声** — 矩阵内对端以立体声 float PCM 播放/混音。
 6. **UI 英文** — Host / Installer / Garage 上补丁按钮文案英文；手册可中文。
 7. **附件生命周期（A 轨）** — MWB 优先；Host 随 Garage 启停；SWB 窗口可关、可由托盘或「Launch SWB」重开。

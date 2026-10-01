@@ -44,6 +44,15 @@ public sealed class AudioMatrixService : IAsyncDisposable
     private int _audioPort;
     private int _lastUnderrunSnapshot;
     private Task? _underrunWatch;
+    private Task? _txPump;
+    private float _txGainCached = 1f;
+    /// <summary>Best-effort TX queue — never block WASAPI/MWB. Drop when full.</summary>
+    private readonly ConcurrentQueue<byte[]> _txQueue = new();
+    private int _txQueueCount;
+    private const int TxQueueMaxPackets = 8;
+    private readonly ConcurrentDictionary<string, string> _resolvedIp =
+        new(StringComparer.OrdinalIgnoreCase);
+    private long _txDropped;
 
     public event Action<string>? Log;
 
@@ -113,7 +122,11 @@ public sealed class AudioMatrixService : IAsyncDisposable
     {
         _remotes[peer.HostName] = new RemoteEndpoint(peer.HostName, peer.IpAddress, peer.AudioPort, includeInMatrix, peer.StereoOk);
         if (!string.IsNullOrWhiteSpace(peer.IpAddress))
+        {
             _ipToHost[peer.IpAddress] = peer.HostName;
+            if (IPAddress.TryParse(peer.IpAddress, out _))
+                _resolvedIp[peer.HostName] = peer.IpAddress;
+        }
         _synth?.EnsurePeer(peer.HostName, _tier, EffectiveSampleRate());
         Log?.Invoke($"Matrix peer: {peer.HostName} @ {peer.IpAddress}:{peer.AudioPort} stereo={peer.StereoOk}");
     }
@@ -164,11 +177,18 @@ public sealed class AudioMatrixService : IAsyncDisposable
         if (_spatial != null)
         {
             _spatial.LocalPlaybackDeviceId = want;
-            _spatial.Save();
+            _spatial.Save(bumpEpoch: false);
         }
         if (_recvEnabled && _synth != null)
             TryRestartOutput();
         Log?.Invoke("Playback device -> " + (LocalAudioDeviceInfo.IsAllDevices(want) ? "All devices" : want));
+    }
+
+    public void SetSendRecv(bool sendLocalLoopback, bool receiveAndMix)
+    {
+        _sendEnabled = sendLocalLoopback;
+        _recvEnabled = receiveAndMix;
+        Log?.Invoke($"Send/Recv -> send={_sendEnabled} recv={_recvEnabled}");
     }
 
     public void SetAudioTier(int tier)
@@ -230,7 +250,13 @@ public sealed class AudioMatrixService : IAsyncDisposable
 
         _audioPort = audioPort;
         _udp = new UdpClient(audioPort);
+        ConfigureUdpCoexistWithMwb(_udp);
+        _txGainCached = LoadTxGainOnce();
+        while (_txQueue.TryDequeue(out _)) { }
+        Interlocked.Exchange(ref _txQueueCount, 0);
+        Interlocked.Exchange(ref _txDropped, 0);
         _ = Task.Run(() => ReceiveLoopAsync(_cts.Token));
+        _txPump = Task.Run(() => TxPumpAsync(_cts.Token));
 
         if (_recvEnabled)
             StartPlayback();
@@ -243,7 +269,51 @@ public sealed class AudioMatrixService : IAsyncDisposable
         if (AudioTier.Get(_tier).Allow24kFallback)
             _underrunWatch = Task.Run(() => UnderrunWatchAsync(_cts.Token));
         var p = AudioTier.Get(_tier);
-        Emit($"Audio matrix up (UDP:{audioPort}, tier={_tier} T={p.FrameMs}ms, send={_sendEnabled}, recv={_recvEnabled})");
+        Emit($"Audio matrix up (UDP:{audioPort}, tier={_tier} T={p.FrameMs}ms, send={_sendEnabled}, recv={_recvEnabled}, tx=best-effort)");
+    }
+
+    /// <summary>
+    /// SWB audio must never starve MWB mouse/keyboard (15100/15101).
+    /// Background DSCP + small buffers + non-blocking send; drop under backpressure.
+    /// </summary>
+    private static void ConfigureUdpCoexistWithMwb(UdpClient udp)
+    {
+        try
+        {
+            var sock = udp.Client;
+            sock.SendBufferSize = 64 * 1024;
+            sock.ReceiveBufferSize = 256 * 1024;
+            sock.Blocking = false;
+            // DSCP CS1 (background / scavenger) — MWB default traffic stays preferred on congested LAN/Wi‑Fi.
+            try { sock.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.TypeOfService, 0x20); } catch { /* ignore */ }
+        }
+        catch { /* ignore */ }
+    }
+
+    private static float LoadTxGainOnce()
+    {
+        try
+        {
+            var gainEnv = Environment.GetEnvironmentVariable("SWB_TX_GAIN");
+            if (string.IsNullOrWhiteSpace(gainEnv))
+            {
+                foreach (var gp in new[]
+                         {
+                             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                                 "MWB-SWB-Host", "tx-gain.txt"),
+                             @"C:\Users\Public\MWB-SWB-Host\tx-gain.txt",
+                         })
+                {
+                    if (!File.Exists(gp)) continue;
+                    gainEnv = File.ReadAllText(gp).Trim();
+                    break;
+                }
+            }
+            if (!string.IsNullOrWhiteSpace(gainEnv) && float.TryParse(gainEnv, out var g) && g > 0)
+                return Math.Clamp(g, 0.25f, 8f);
+        }
+        catch { /* ignore */ }
+        return 1f;
     }
 
     public Task StopAsync()
@@ -266,6 +336,10 @@ public sealed class AudioMatrixService : IAsyncDisposable
         try { _udp?.Close(); } catch { /* ignore */ }
         _udp?.Dispose();
         _udp = null;
+        try { _txPump?.Wait(500); } catch { /* ignore */ }
+        _txPump = null;
+        while (_txQueue.TryDequeue(out _)) { }
+        Interlocked.Exchange(ref _txQueueCount, 0);
         _cts?.Dispose();
         _cts = null;
         return Task.CompletedTask;
@@ -310,7 +384,8 @@ public sealed class AudioMatrixService : IAsyncDisposable
             {
                 try
                 {
-                    if (_tier >= 5 && !LooksLikeVirtualName(pick.FriendlyName + " " + pick.DeviceFriendlyName))
+                    if (_tier >= 5 && !LooksLikeVirtualName(pick.FriendlyName + " " + pick.DeviceFriendlyName)
+                        && !PreferSharedPlayout())
                     {
                         try
                         {
@@ -397,8 +472,8 @@ public sealed class AudioMatrixService : IAsyncDisposable
             }
         }
 
-        // Single default device (Shared / Exclusive for t5-t6).
-        if (_tier >= 5 && !LooksLikeVirtualRenderDevice())
+        // Single default device (Shared; Exclusive only when not SyncOnly and t5+).
+        if (_tier >= 5 && !LooksLikeVirtualRenderDevice() && !PreferSharedPlayout())
         {
             try
             {
@@ -437,6 +512,10 @@ public sealed class AudioMatrixService : IAsyncDisposable
         name.Contains("VMware", StringComparison.OrdinalIgnoreCase)
         || name.Contains("Virtual", StringComparison.OrdinalIgnoreCase)
         || name.Contains("Remote Audio", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Sync-only mesh prefers Shared — Exclusive + tiny buffers caused digital distortion.</summary>
+    private bool PreferSharedPlayout() =>
+        _spatial != null && _spatial.SpatialMode == SpatialLayoutMode.SyncOnly;
 
     private void TryRestartOutput()
     {
@@ -643,28 +722,14 @@ public sealed class AudioMatrixService : IAsyncDisposable
                 if (applyAec && _aec != null && _recvEnabled && EchoCanceller.ShouldSuppressSend(residualPeak, hold, capturePeak))
                 {
                     // dedup: do not rebroadcast remote playback
+                    LogRare("aec-suppress", $"AEC suppress send residual={residualPeak:F3} cap={capturePeak:F3} rxHold={hold:F3}");
                     if (read < frameFloats) break;
                     continue;
                 }
 
-                var txGain = 1f;
-                var gainEnv = Environment.GetEnvironmentVariable("SWB_TX_GAIN");
-                if (string.IsNullOrWhiteSpace(gainEnv))
-                {
-                    foreach (var gp in new[]
-                             {
-                                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                                     "MWB-SWB-Host", "tx-gain.txt"),
-                                 @"C:\Users\Public\MWB-SWB-Host\tx-gain.txt",
-                             })
-                    {
-                        if (!File.Exists(gp)) continue;
-                        gainEnv = File.ReadAllText(gp).Trim();
-                        break;
-                    }
-                }
-                if (!string.IsNullOrWhiteSpace(gainEnv) && float.TryParse(gainEnv, out var gParsed) && gParsed > 0)
-                    txGain = Math.Clamp(gParsed, 0.25f, 8f);
+                NoteTxPeak(residualPeak);
+
+                var txGain = _txGainCached;
                 if (Math.Abs(txGain - 1f) > 0.01f)
                 {
                     for (var gi = 0; gi < span.Length; gi++)
@@ -675,9 +740,8 @@ public sealed class AudioMatrixService : IAsyncDisposable
                         span[gi] = v;
                     }
                     residualPeak = Math.Min(1f, residualPeak * txGain);
+                    NoteTxPeak(residualPeak);
                 }
-
-                NoteTxPeak(residualPeak);
 
                 var pcm = _pcmScratch.AsSpan(0, frameFloats);
                 SwbAudioFrame.FloatToPcm16(span, pcm);
@@ -690,10 +754,10 @@ public sealed class AudioMatrixService : IAsyncDisposable
                     (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds());
                 var packet = SwbAudioFrame.Encode(hdr, pcm);
                 if (_remotes.Count == 0)
-                    LogRare("tx-no-peers", "Capture has audio but remotes=0 鈥?not sending");
+                    LogRare("tx-no-peers", "Capture has audio but remotes=0 - not sending");
                 else
                     LatencyStageLog.MarkCaptureSend();
-                BroadcastPacket(packet);
+                EnqueueTxPacket(packet);
 
                 if (read < frameFloats) break;
             }
@@ -704,7 +768,45 @@ public sealed class AudioMatrixService : IAsyncDisposable
         }
     }
 
-    private void BroadcastPacket(byte[] packet)
+    /// <summary>Capture thread must return immediately - never sync DNS/UDP here (MWB input first).</summary>
+    private void EnqueueTxPacket(byte[] packet)
+    {
+        if (Volatile.Read(ref _txQueueCount) >= TxQueueMaxPackets)
+        {
+            Interlocked.Increment(ref _txDropped);
+            LogRare("tx-drop", $"SWB TX drop (queue full) totalDropped={Volatile.Read(ref _txDropped)} - protecting MWB");
+            return;
+        }
+        _txQueue.Enqueue(packet);
+        Interlocked.Increment(ref _txQueueCount);
+    }
+
+    private async Task TxPumpAsync(CancellationToken ct)
+    {
+        try { Thread.CurrentThread.Priority = ThreadPriority.BelowNormal; } catch { /* ignore */ }
+
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                if (!_txQueue.TryDequeue(out var packet))
+                {
+                    await Task.Delay(1, ct).ConfigureAwait(false);
+                    continue;
+                }
+                Interlocked.Decrement(ref _txQueueCount);
+                SendPacketToRemotes(packet);
+            }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex)
+            {
+                LogRare($"tx-pump:{ex.Message}", "TX pump: " + ex.Message);
+                try { await Task.Delay(5, ct).ConfigureAwait(false); } catch { break; }
+            }
+        }
+    }
+
+    private void SendPacketToRemotes(byte[] packet)
     {
         if (_udp == null) return;
         foreach (var remote in _remotes.Values)
@@ -712,24 +814,47 @@ public sealed class AudioMatrixService : IAsyncDisposable
             if (!remote.IncludeInMatrix) continue;
             try
             {
-                var dest = remote.IpAddress;
-                if (!IPAddress.TryParse(dest, out _))
+                var dest = ResolveRemoteIpCached(remote);
+                if (string.IsNullOrWhiteSpace(dest)) continue;
+                try
                 {
-                    try
-                    {
-                        var addrs = Dns.GetHostAddresses(dest);
-                        var v4 = addrs.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork);
-                        if (v4 != null) dest = v4.ToString();
-                    }
-                    catch { /* keep dest */ }
+                    _udp.Send(packet, packet.Length, dest, remote.AudioPort);
                 }
-                _udp.Send(packet, packet.Length, dest, remote.AudioPort);
+                catch (SocketException se) when (
+                    se.SocketErrorCode is SocketError.WouldBlock
+                        or SocketError.NoBufferSpaceAvailable
+                        or SocketError.TimedOut)
+                {
+                    Interlocked.Increment(ref _txDropped);
+                }
             }
             catch (Exception ex)
             {
                 LogRare($"udp-tx:{remote.HostName}:{ex.Message}", $"UDP -> {remote.HostName}: {ex.Message}");
             }
         }
+    }
+
+    private string? ResolveRemoteIpCached(RemoteEndpoint remote)
+    {
+        var dest = remote.IpAddress;
+        if (string.IsNullOrWhiteSpace(dest)) return null;
+        if (IPAddress.TryParse(dest, out _)) return dest;
+        if (_resolvedIp.TryGetValue(dest, out var cached) && !string.IsNullOrWhiteSpace(cached))
+            return cached;
+        try
+        {
+            var addrs = Dns.GetHostAddresses(dest);
+            var v4 = addrs.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork);
+            if (v4 != null)
+            {
+                var ip = v4.ToString();
+                _resolvedIp[dest] = ip;
+                return ip;
+            }
+        }
+        catch { /* keep unresolved */ }
+        return dest;
     }
 
     private async Task ReceiveLoopAsync(CancellationToken ct)

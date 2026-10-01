@@ -5,12 +5,12 @@ namespace MwbSwb.Audio;
 
 /// <summary>
 /// WASAPI process loopback excluding this process tree (Host WasapiOut).
-/// Win10 Build 20348+ / Server 2022.
-/// Activation uses native helper (managed ActivateAudioInterfaceAsync CCW returns E_NOINTERFACE).
+/// Win10 2004+ (Build 19041+). Activation uses native helper
+/// (managed ActivateAudioInterfaceAsync CCW returns E_NOINTERFACE).
 /// </summary>
 public sealed class ProcessExcludeLoopbackCapture : IDisposable
 {
-    public const int MinOsBuild = 20348;
+    public const int MinOsBuild = 19041;
     private static readonly Guid IidCaptureClient = new("C8ADBD64-E71E-48A0-A4DE-185C395CD645");
 
     private readonly uint _targetPid;

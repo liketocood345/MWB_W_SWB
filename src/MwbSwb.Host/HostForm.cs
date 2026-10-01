@@ -16,9 +16,15 @@ public sealed class HostForm : Form
     private readonly Button _btnAbout = new();
     private SwbForm? _swb;
     private readonly System.Windows.Forms.Timer _mwbWatch = new() { Interval = 1500 };
+    private int _mwbGoneTicks;
+    /// <summary>Sustained MWB-absent ticks before Host exits (~45s). Install/stub gap must not flash-exit.</summary>
+    private const int MwbGoneExitTicks = 30;
     private bool _mwbWasRunning;
     private bool _userClosedSwb;
     private bool _openSwbOnStart;
+    private readonly long _startedTick = Environment.TickCount64;
+    /// <summary>Do not exit Host for MWB-absent during install / cold start settle.</summary>
+    private const int StartupHoldMs = 120_000;
 
     public void SetOpenSwbOnStart(bool value) => _openSwbOnStart = value;
 
@@ -83,7 +89,8 @@ public sealed class HostForm : Form
             if (_openSwbOnStart)
             {
                 _openSwbOnStart = false;
-                BeginInvoke(() => EnsureSwbAttachment(showWindow: true, enableSynchro: true));
+                // Open window; Sound Synchro on/off follows last persisted SoundSynchro.json.
+                BeginInvoke(() => EnsureSwbAttachment(showWindow: true, enableSynchro: null));
             }
         };
 
@@ -184,22 +191,45 @@ public sealed class HostForm : Form
     private void OnMwbWatchTick()
     {
         var running = GarageMwbSettings.IsGarageProcessRunning();
+        var holdMs = Environment.TickCount64 - _startedTick;
+        var inStartupHold = holdMs < StartupHoldMs;
+
         if (running && !_mwbWasRunning)
         {
-            AppendLog("Garage MWB detected - SWB attachment + window (latency slider).");
+            _mwbGoneTicks = 0;
+            AppendLog("Garage MWB detected - SWB attachment (synchro follows last on/off).");
             try
             {
                 File.AppendAllText(@"C:\Users\Public\swb-enable.log",
-                    $"[{DateTime.Now:HH:mm:ss}] Host: MWB detected -> EnsureSwbAttachment(showWindow=true){Environment.NewLine}");
+                    $"[{DateTime.Now:HH:mm:ss}] Host: MWB detected -> EnsureSwbAttachment(showWindow=false, synchro=persisted){Environment.NewLine}");
             }
             catch { /* ignore */ }
-            // Enable mesh silently; do not pop SWB / balloons.
+            // Silent attach; inherit SoundSynchro.Enabled from last session (do not force on).
             if (!_userClosedSwb)
-                EnsureSwbAttachment(showWindow: true, enableSynchro: true);
+                EnsureSwbAttachment(showWindow: false, enableSynchro: null);
         }
         else if (!running && _mwbWasRunning)
         {
-            AppendLog("Garage MWB stopped - closing SWB attachment.");
+            _mwbGoneTicks++;
+            if (inStartupHold)
+            {
+                if (_mwbGoneTicks == 1 || (_mwbGoneTicks % 10) == 0)
+                    AppendLog($"Garage MWB not seen during startup hold ({holdMs / 1000}s/{StartupHoldMs / 1000}s) - Host stays.");
+                // Tear down SWB mesh only after a few misses; keep Host alive.
+                if (_mwbGoneTicks == 3)
+                    _ = CloseSwbOnlyAsync();
+                return;
+            }
+
+            if (_mwbGoneTicks < MwbGoneExitTicks)
+            {
+                AppendLog($"Garage MWB not seen (grace {_mwbGoneTicks}/{MwbGoneExitTicks}) - not exiting yet.");
+                if (_mwbGoneTicks == 3)
+                    _ = CloseSwbOnlyAsync();
+                return;
+            }
+
+            AppendLog("Garage MWB stopped - closing SWB Host.");
             _ = CloseSwbOnlyAsync();
             _mwbWatch.Stop();
             BeginInvoke(async () =>
@@ -207,10 +237,17 @@ public sealed class HostForm : Form
                 await ShutdownAsync();
                 Application.Exit();
             });
+            return;
         }
         else if (!running && !_mwbWasRunning)
         {
-            _status.Text = "Waiting for Garage Mouse without Borders... (SWB attaches when MWB starts)";
+            _status.Text = inStartupHold
+                ? $"Waiting for Garage Mouse without Borders... (startup hold {holdMs / 1000}s)"
+                : "Waiting for Garage Mouse without Borders... (SWB attaches when MWB starts)";
+        }
+        else if (running)
+        {
+            _mwbGoneTicks = 0;
         }
 
         _mwbWasRunning = running;
@@ -246,7 +283,7 @@ public sealed class HostForm : Form
         }
         catch { /* ignore */ }
 
-        EnsureSwbAttachment(showWindow: true, enableSynchro: true);
+        EnsureSwbAttachment(showWindow: true, enableSynchro: null);
     }
 
     private void ShowHostStatus()
@@ -261,13 +298,13 @@ public sealed class HostForm : Form
     }
 
     private void OpenSwbWindow(bool enableSynchro = false)
-        => EnsureSwbAttachment(showWindow: true, enableSynchro: enableSynchro);
+        => EnsureSwbAttachment(showWindow: true, enableSynchro: enableSynchro ? true : null);
 
     /// <summary>
-    /// Create SWB attachment. Window only when <paramref name="showWindow"/> is true
-    /// (tray / Launch SWB). MWB attach path enables synchro headlessly.
+    /// Create SWB attachment. <paramref name="enableSynchro"/> null = inherit SoundSynchro.json Enabled;
+    /// true force on; false leave UI as-is without forcing enable.
     /// </summary>
-    private void EnsureSwbAttachment(bool showWindow, bool enableSynchro)
+    private void EnsureSwbAttachment(bool showWindow, bool? enableSynchro)
     {
         if (!GarageMwbSettings.IsGarageProcessRunning())
         {
@@ -293,8 +330,10 @@ public sealed class HostForm : Form
         if (!_swb.IsHandleCreated)
             _ = _swb.Handle;
 
-        if (enableSynchro)
+        if (enableSynchro == true)
             _swb.EnsureSoundSynchroEnabled();
+        else if (enableSynchro == null)
+            _swb.ApplyPersistedSynchroState();
 
         if (showWindow)
         {
@@ -303,14 +342,14 @@ public sealed class HostForm : Form
             try
             {
                 File.AppendAllText(@"C:\Users\Public\swb-enable.log",
-                    $"[{DateTime.Now:HH:mm:ss}] Opened SWB window show=true{Environment.NewLine}");
+                    $"[{DateTime.Now:HH:mm:ss}] Opened SWB window show=true synchroPersisted={enableSynchro is null}{Environment.NewLine}");
             }
             catch { /* ignore */ }
         }
         else
-            AppendLog("SWB attachment enabled (window hidden).");
+            AppendLog("SWB attachment ready (window hidden; synchro=" +
+                      (enableSynchro == true ? "force-on" : "persisted") + ").");
 
-        // /open-swb and tray: always reveal even if synchro was already enabled headlessly.
         if (showWindow && _swb != null && !_swb.IsDisposed)
             _swb.RevealWindow();
     }

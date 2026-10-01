@@ -33,3 +33,5 @@
 | P2b Garage 附件轨 + Launch SWB + 同 key 发现 | Done（A 轨，当前验收） |
 | P3 托盘双喇叭电平 + 回声门控 | Done |
 | P4 Audio hardening（7 档延时 / MatrixSynth / AEC 去重 / 12B 秒戳帧） | Done |
+
+易复发安装/互联坑见 [10-BUG-HOTSPOTS.md](10-BUG-HOTSPOTS.md)。

@@ -17,6 +17,7 @@ UI 字符串（Host / Installer / 补丁按钮）**纯英文**；手册与说明
 | [07-GARAGE-ATTACHMENT.md](07-GARAGE-ATTACHMENT.md) | **当前默认轨**：Garage MWB 附件、同 key 发现、Launch SWB |
 | [08-VM-TESTBED.md](08-VM-TESTBED.md) | 双 VM 测试床、禁止 CD 热插、交付方式 |
 | [09-TEST-REPORT-20260925-17h.md](09-TEST-REPORT-20260925-17h.md) | 本机播放设备 + 双 VM 功能/延时报告（小时戳；隐私代称） |
+| [10-BUG-HOTSPOTS.md](10-BUG-HOTSPOTS.md) | **Bug 热点**：SAW/同钥/Setup·Host 自包含/等待与 stub 等易复发坑 |
 
 远程仓（源码）：https://github.com/liketocood345/MWB_W_SWB  
 上游 MWB（MIT）：Microsoft PowerToys / Garage Mouse without Borders。
